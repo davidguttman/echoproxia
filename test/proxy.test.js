@@ -10,6 +10,24 @@ const { createProxy } = require('../src/index') // Import the actual module inte
 
 const TEST_RECORDINGS_DIR = path.join(__dirname, '__test_recordings__')
 
+// Helper function to wait for file existence
+async function waitForFile (filePath, timeoutMs = 2000, intervalMs = 100) {
+  const startTime = Date.now()
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      await fs.access(filePath)
+      return true // File exists
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        throw err // Re-throw unexpected errors
+      }
+      // File doesn't exist yet, wait and retry
+      await new Promise(resolve => setTimeout(resolve, intervalMs))
+    }
+  }
+  return false // Timeout reached
+}
+
 // --- Mock Target Server Setup ---
 let mockTargetServer
 let lastMockRequest = null
@@ -113,7 +131,11 @@ test.serial('Record Mode: should proxy request and save recording', async t => {
   t.is(lastMockRequest.method, 'GET')
   t.is(lastMockRequest.path, `${requestPath}${requestQuery}`)
 
-  // Assert recording file was created
+  // Wait for the recording file to appear
+  const fileExists = await waitForFile(recordingFilePath)
+  t.true(fileExists, 'Recording file should be created within timeout')
+
+  // Assert recording file was created (now redundant with waitForFile but keep for clarity)
   try {
     await fs.access(recordingFilePath)
     t.pass('Recording file should exist')
@@ -121,16 +143,20 @@ test.serial('Record Mode: should proxy request and save recording', async t => {
     t.fail('Recording file should exist')
   }
 
-  // Assert recording content (basic check) - This will likely fail now as createProxy is a stub
+  // Assert recording content (basic check)
   try {
     const recordings = JSON.parse(await fs.readFile(recordingFilePath, 'utf8'))
     t.is(recordings.length, 1, 'Should have one recording')
     const recorded = recordings[0]
     t.is(recorded.request.method, 'GET')
+    t.is(recorded.request.path, requestPath) // Check path too
     t.is(recorded.response.status, 200)
+    // Add a check for response body structure if needed
+    t.deepEqual(recorded.response.body.data, JSON.stringify({ message: 'mock get success', query: { query: '1', param: 'value' } }))
+    t.is(recorded.response.body.encoding, 'utf8') // Assuming UTF-8 for JSON
   } catch (e) {
-    t.log('Failed to read/parse recording - expected during initial implementation', e.message)
-    // Don't fail the test here yet, just log. We *expect* this part to fail.
+    t.log('Failed to read/parse/validate recording', e)
+    t.fail(`Recording content validation failed: ${e.message}`)
   }
 })
 
