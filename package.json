@@ -1,0 +1,28 @@
+{
+  "name": "echoproxia",
+  "version": "1.0.0",
+  "description": "Echoproxia provides a simple Express-based HTTP proxy server designed for recording and replaying HTTP interactions during testing. It allows dynamically switching between different recording sequences (e.g., for different tests or test steps) while the server is running.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "ava"
+  },
+  "dependencies": {
+    "express": "^4.17.1",
+    "http-proxy-middleware": "^2.0.0",
+    "get-port": "^5.1.1"
+  },
+  "devDependencies": {
+    "ava": "^4.0.0",
+    "axios": "^0.21.1",
+    "rimraf": "^3.0.2"
+  },
+  "ava": {
+    "files": [
+      "test/**/*.test.js"
+    ],
+    "verbose": true
+  },
+  "keywords": [],
+  "author": "David Guttman <david@davidguttman.com> (http://davidguttman.com/)",
+  "license": "MIT"
+}
