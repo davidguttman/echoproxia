@@ -5,6 +5,11 @@ const fs = require('fs').promises
 const { createProxyMiddleware } = require('http-proxy-middleware')
 const zlib = require('zlib')
 const getPort = require('get-port')
+const debug = require('debug')
+
+const logInfo = debug('echoproxia:info')
+const logWarn = debug('echoproxia:warn')
+const logError = debug('echoproxia:error')
 
 // --- Helper Functions ---
 function sanitizeFilename (filePath) {
@@ -33,7 +38,7 @@ async function readRecordings (filePath) {
     if (err.code === 'ENOENT') {
       return []
     }
-    console.error(`Error reading or parsing recording file ${filePath}:`, err)
+    logError(`Error reading or parsing recording file ${filePath}:`, err)
     return []
   }
 }
@@ -45,9 +50,9 @@ async function writeRecording (filePath, recording) {
     const recordings = await readRecordings(filePath)
     recordings.push(recording)
     await fs.writeFile(filePath, JSON.stringify(recordings, null, 2))
-    console.log(`Recorded interaction to ${filePath}`)
+    logInfo(`Recorded interaction to ${filePath}`)
   } catch (error) {
-    console.error(`Error writing recording to ${filePath}:`, error)
+    logError(`Error writing recording to ${filePath}:`, error)
   }
 }
 // --- End Helper Functions ---
@@ -81,7 +86,7 @@ async function createProxy (options = {}) {
   // A more robust solution might involve a dedicated control port or more unique path.
   app.post('/echoproxia/sequence/:name', express.json(), (req, res) => {
     currentSequenceName = req.params.name
-    console.log(`[Echoproxia] Sequence set to: ${currentSequenceName}`)
+    logInfo(`Sequence set to: ${currentSequenceName}`)
     if (!replayCounters[currentSequenceName]) {
       replayCounters[currentSequenceName] = {}
     }
@@ -92,7 +97,7 @@ async function createProxy (options = {}) {
   async function handleReplay (req, res, { recordingFilepath }) {
     const sequenceRecordings = await readRecordings(recordingFilepath)
     if (sequenceRecordings.length === 0) {
-      console.warn(`[Echoproxia] Replay warning: Recording file not found or empty: ${recordingFilepath}`)
+      logWarn(`Replay warning: Recording file not found or empty: ${recordingFilepath}`)
       res.status(500).send(`Echoproxia Replay Error: No recording found for path ${req.path} in sequence ${currentSequenceName}.`)
       return false
     }
@@ -104,7 +109,7 @@ async function createProxy (options = {}) {
     const currentIndex = sequenceReplayState[recordingFilepath] || 0
 
     if (currentIndex >= sequenceRecordings.length) {
-      console.warn(`[Echoproxia] Replay warning: Sequence exhausted for ${recordingFilepath}`)
+      logWarn(`Replay warning: Sequence exhausted for ${recordingFilepath}`)
       res.status(500).send(`Echoproxia Replay Error: Sequence exhausted for path ${req.path} in sequence ${currentSequenceName}.`)
       return false
     }
@@ -132,7 +137,7 @@ async function createProxy (options = {}) {
       try {
         res.setHeader(key, value)
       } catch (headerErr) {
-        console.warn(`[Echoproxia] Could not set header ${key}: ${value} - ${headerErr.message}`)
+        logWarn(`Could not set header ${key}: ${value} - ${headerErr.message}`)
       }
     })
 
@@ -144,7 +149,7 @@ async function createProxy (options = {}) {
     res.removeHeader('transfer-encoding')
 
     res.send(finalBodyBuffer)
-    console.log(`[Echoproxia] Replayed interaction from ${recordingFilepath} at index ${currentIndex}`)
+    logInfo(`Replayed interaction from ${recordingFilepath} at index ${currentIndex}`)
     return true
   }
 
@@ -168,7 +173,7 @@ async function createProxy (options = {}) {
       const replayed = await handleReplay(req, res, { recordingFilepath })
       if (!replayed && !res.headersSent) {
         // handleReplay already sent 500, but if somehow it didn't...
-        console.error('[Echoproxia] Replay failed unexpectedly without sending response.')
+        logError('Replay failed unexpectedly without sending response.')
         res.status(500).send('Internal Echoproxia Replay Error.')
       }
       // Don't call next() in replay mode, response is handled or error sent
@@ -208,7 +213,7 @@ async function createProxy (options = {}) {
                 decompressedBodyBuffer = zlib.inflateSync(completeBodyBuffer)
               }
             } catch (unzipErr) {
-              console.error('[Echoproxia] Error decompressing response body:', unzipErr)
+              logError('Error decompressing response body:', unzipErr)
               decompressedBodyBuffer = completeBodyBuffer // Use original if decompression fails
             }
 
@@ -257,7 +262,7 @@ async function createProxy (options = {}) {
             res.end(decompressedBodyBuffer)
           })
           proxyRes.on('error', (error, req, res) => {
-            console.error('[Echoproxia] Proxy Response Error:', error);
+            logError('Proxy Response Error:', error);
             if (!res.headersSent) {
               res.writeHead(500, { 'Content-Type': 'text/plain' });
             }
@@ -265,7 +270,7 @@ async function createProxy (options = {}) {
           })
         },
         onError: (err, req, res) => {
-          console.error('[Echoproxia] Proxy Error:', err);
+          logError('Proxy Error:', err);
           if (!res.headersSent) {
             res.writeHead(502, { 'Content-Type': 'text/plain' });
           }
@@ -282,8 +287,8 @@ async function createProxy (options = {}) {
   return new Promise((resolve, reject) => {
     try {
       runningServer = app.listen(actualPort, () => {
-        console.log(`[Echoproxia] Server listening on port ${actualPort}`)
-        console.log(`[Echoproxia] Mode: ${currentRecordMode ? 'Record' : 'Replay'}, Target: ${currentTargetUrl}, Recordings: ${currentRecordingsDir}`)
+        logInfo(`Server listening on port ${actualPort}`)
+        logInfo(`Mode: ${currentRecordMode ? 'Record' : 'Replay'}, Target: ${currentTargetUrl}, Recordings: ${currentRecordingsDir}`)
 
         // --- Return Control Object ---
         resolve({
@@ -292,7 +297,7 @@ async function createProxy (options = {}) {
           server: runningServer,
           setSequence: (sequenceName) => {
             currentSequenceName = sequenceName
-            console.log(`[Echoproxia] Sequence set to: ${currentSequenceName}`)
+            logInfo(`Sequence set to: ${currentSequenceName}`)
             if (!replayCounters[currentSequenceName]) {
               replayCounters[currentSequenceName] = {}
             }
@@ -303,7 +308,7 @@ async function createProxy (options = {}) {
               if (runningServer) {
                 runningServer.close((err) => {
                   if (err) return rejectStop(err)
-                  console.log('[Echoproxia] Server stopped')
+                  logInfo('Server stopped')
                   runningServer = null
                   resolveStop()
                 })
@@ -316,12 +321,12 @@ async function createProxy (options = {}) {
       })
 
       runningServer.on('error', (err) => {
-        console.error('[Echoproxia] Server error:', err)
+        logError('Server error:', err)
         reject(err)
       })
 
     } catch (err) {
-       console.error('[Echoproxia] Failed to start server:', err)
+       logError('Failed to start server:', err)
        reject(err)
     }
 
