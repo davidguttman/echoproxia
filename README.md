@@ -44,16 +44,17 @@ test.before(async t => {
   // Store the proxy control object on the context
   t.context.proxy = proxy
 
-  console.log(`Echoproxia running in ${recordMode ? 'record' : 'replay'} mode on ${proxy.url}, using base directory ${recordingsDir}`)
+  // Now you can access the proxy's URL and control functions
+  console.log(`Echoproxia running in ${recordMode ? 'record' : 'replay'} mode on ${t.context.proxy.url}, using base directory ${recordingsDir}`)
 
   // Configure your application to use the proxy url directly
-  // Example: myApiClient.setBaseUrl(proxy.url)
+  // Example: myApiClient.setBaseUrl(t.context.proxy.url)
 })
 
 test.after.always(async t => {
-  // Access server via context and close it
-  if (t.context.proxy && t.context.proxy.server) {
-    await new Promise(resolve => t.context.proxy.server.close(resolve))
+  // Use the stop method returned by createProxy
+  if (t.context.proxy && t.context.proxy.stop) {
+    await t.context.proxy.stop()
     console.log('Echoproxia stopped')
   }
 })
@@ -90,6 +91,7 @@ Creates and starts an Echoproxia instance, returning controls and details.
     *   `url` `<String>`: The base URL of the running proxy server (e.g., `http://localhost:<port>`).
     *   `server` `<http.Server>`: The underlying Node.js HTTP Server instance. Can be used to close the server (e.g., `proxy.server.close()`).
     *   `setSequence` `<Function>`: A function `(sequenceName <String>) => void` that sets the active recording sequence name. Recordings will be read from/written to `<recordingsDir>/<sequenceName>/` after this is called.
+    *   `stop` `<Function>`: An asynchronous function `async () => void` that stops the proxy server.
 
 ## Recording and Replay Mechanism
 
