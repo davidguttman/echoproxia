@@ -99,7 +99,7 @@ async function createProxy (options = {}) {
     if (sequenceRecordings.length === 0) {
       logWarn(`Replay warning: Recording file not found or empty: ${recordingFilepath}`)
       res.status(500).send(`Echoproxia Replay Error: No recording found for path ${req.path} in sequence ${currentSequenceName}.`)
-      return false
+      return false // Indicate failure
     }
 
     if (!replayCounters[currentSequenceName]) {
@@ -111,46 +111,54 @@ async function createProxy (options = {}) {
     if (currentIndex >= sequenceRecordings.length) {
       logWarn(`Replay warning: Sequence exhausted for ${recordingFilepath}`)
       res.status(500).send(`Echoproxia Replay Error: Sequence exhausted for path ${req.path} in sequence ${currentSequenceName}.`)
-      return false
+      return false // Indicate failure
     }
 
     const { response: recordedResponse } = sequenceRecordings[currentIndex]
-    sequenceReplayState[recordingFilepath] = currentIndex + 1
+    sequenceReplayState[recordingFilepath] = currentIndex + 1 // Increment counter
 
-    let responseBodyBuffer
-    if (recordedResponse.body.encoding === 'base64') {
-      responseBodyBuffer = Buffer.from(recordedResponse.body.data, 'base64')
-    } else {
-      responseBodyBuffer = Buffer.from(recordedResponse.body.data, 'utf8')
+    // --- Streaming Replay Refactor ---
+    if (!recordedResponse.chunks || !Array.isArray(recordedResponse.chunks)) {
+      logError(`Replay Error: Recording at index ${currentIndex} for ${recordingFilepath} is missing or has invalid 'chunks' format.`)
+      res.status(500).send(`Echoproxia Replay Error: Invalid recording format for path ${req.path} in sequence ${currentSequenceName}.`)
+      return false // Indicate failure
     }
 
-    const targetContentEncoding = recordedResponse.body.originalContentEncoding
-    let finalBodyBuffer = responseBodyBuffer
-    if (targetContentEncoding === 'gzip') {
-      finalBodyBuffer = zlib.gzipSync(responseBodyBuffer)
-    } else if (targetContentEncoding === 'deflate') {
-      finalBodyBuffer = zlib.deflateSync(responseBodyBuffer)
-    }
-
-    res.status(recordedResponse.status)
+    // 1. Send Headers
+    res.status(recordedResponse.status);
     Object.entries(recordedResponse.headers).forEach(([key, value]) => {
-      try {
-        res.setHeader(key, value)
-      } catch (headerErr) {
-        logWarn(`Could not set header ${key}: ${value} - ${headerErr.message}`)
+      // Filter out problematic headers for replay, e.g., content-length calculated per chunk
+      // Transfer-Encoding: chunked is usually handled by Node automatically when streaming
+      const lowerKey = key.toLowerCase();
+      if (lowerKey !== 'content-length' && lowerKey !== 'transfer-encoding') {
+          try {
+              res.setHeader(key, value);
+          } catch (headerErr) {
+              logWarn(`Could not set header during replay ${key}: ${value} - ${headerErr.message}`);
+          }
       }
-    })
+    });
+    // Send headers before body/chunks
+    res.writeHead(recordedResponse.status);
 
-    if (targetContentEncoding) {
-      res.setHeader('content-encoding', targetContentEncoding)
+    // 2. Stream Chunks
+    for (const base64Chunk of recordedResponse.chunks) {
+      try {
+        const chunkBuffer = Buffer.from(base64Chunk, 'base64');
+        res.write(chunkBuffer); // Write chunk to client
+      } catch (decodeErr) {
+        logError(`Replay Error: Failed to decode base64 chunk at index ${currentIndex} for ${recordingFilepath}: ${decodeErr.message}`);
+        // Decide how to handle: stop replay? send error? For now, we stop.
+        res.end(); // End response abruptly on error
+        return false; // Indicate failure
+      }
     }
-    res.removeHeader('content-length')
-    res.setHeader('content-length', Buffer.byteLength(finalBodyBuffer))
-    res.removeHeader('transfer-encoding')
 
-    res.send(finalBodyBuffer)
-    logInfo(`Replayed interaction from ${recordingFilepath} at index ${currentIndex}`)
-    return true
+    // 3. End Stream
+    res.end(); // Signal end of stream after all chunks are sent
+
+    logInfo(`Replayed ${recordedResponse.chunks.length} chunks from ${recordingFilepath} at index ${currentIndex}`)
+    return true // Indicate success
   }
 
   // --- Proxy Middleware Setup ---
@@ -193,81 +201,75 @@ async function createProxy (options = {}) {
           proxyReq.end()
         },
         onProxyRes: (proxyRes, req, res) => {
-          let responseBodyChunks = []
+          // --- Streaming Refactor ---
+          // Immediately forward headers from the target response to the client
+          Object.keys(proxyRes.headers).forEach((key) => {
+            // Some headers (like transfer-encoding) might cause issues if blindly copied.
+            // We might need more sophisticated filtering later.
+            res.setHeader(key, proxyRes.headers[key]);
+          });
+          res.writeHead(proxyRes.statusCode);
+
+          const recordedChunks = []; // Array to store chunks for recording
+          let completeBodyForLogging = Buffer.alloc(0) // Still buffer for potential non-stream logging/debugging if needed later
+
           proxyRes.on('data', (chunk) => {
-            responseBodyChunks.push(chunk)
-          })
+            // 1. Send the chunk immediately to the client
+            res.write(chunk);
+            // 2. Capture the chunk for recording
+            recordedChunks.push(chunk.toString('base64')); // Store as base64
+            // 3. (Optional) Append to complete buffer if needed elsewhere
+            completeBodyForLogging = Buffer.concat([completeBodyForLogging, chunk])
+          });
+
           proxyRes.on('end', async () => {
-            const completeBodyBuffer = Buffer.concat(responseBodyChunks)
-            const responseStatus = proxyRes.statusCode
-            const responseHeaders = { ...proxyRes.headers } // Clone headers
+            // 1. Signal the end of the response stream to the client
+            res.end();
 
-            let decompressedBodyBuffer = completeBodyBuffer
-            const contentEncoding = responseHeaders['content-encoding']
-            const originalContentEncoding = Array.isArray(contentEncoding) ? contentEncoding[0] : contentEncoding
+            // 2. Now, process and save the recording with the captured chunks
+            const responseStatus = proxyRes.statusCode;
+            // Clone original headers for recording, BEFORE potential manipulation
+            const headersForRecording = redactHeaders({ ...proxyRes.headers }, headersToRedact);
 
-            try {
-              if (contentEncoding === 'gzip') {
-                decompressedBodyBuffer = zlib.gunzipSync(completeBodyBuffer)
-              } else if (contentEncoding === 'deflate') {
-                decompressedBodyBuffer = zlib.inflateSync(completeBodyBuffer)
-              }
-            } catch (unzipErr) {
-              logError('Error decompressing response body:', unzipErr)
-              decompressedBodyBuffer = completeBodyBuffer // Use original if decompression fails
-            }
-
-            let bodyStorage
-            try {
-              const utf8String = decompressedBodyBuffer.toString('utf8')
-              if (Buffer.compare(Buffer.from(utf8String, 'utf8'), decompressedBodyBuffer) === 0) {
-                bodyStorage = { encoding: 'utf8', data: utf8String }
-              } else {
-                throw new Error('Not safely decodable as UTF-8 string')
-              }
-            } catch (e) {
-              bodyStorage = { encoding: 'base64', data: decompressedBodyBuffer.toString('base64') }
-            }
-
-            const recordingFilename = sanitizeFilename(req.path)
-            const recordingFilepath = path.join(currentRecordingsDir, currentSequenceName, recordingFilename)
+            const recordingFilename = sanitizeFilename(req.path);
+            const recordingFilepath = path.join(currentRecordingsDir, currentSequenceName, recordingFilename);
 
             const recordedRequest = {
               method: req.method,
               path: req.path,
               originalUrl: req.originalUrl,
               headers: redactHeaders(req.headers, headersToRedact),
-              body: req.body instanceof Buffer ? req.body.toString('base64') : null
-            }
+              // Ensure request body is stored appropriately (assuming it wasn't streamed)
+              body: req.body instanceof Buffer ? req.body.toString('base64') : (typeof req.body === 'string' ? req.body : null)
+            };
 
+            // New structure for recorded response, storing chunks
             const recordedResponse = {
               status: responseStatus,
-              headers: redactHeaders({ ...responseHeaders }, headersToRedact), // Redact cloned headers
-              body: {
-                ...bodyStorage,
-                originalContentEncoding: originalContentEncoding || null
-              }
-            }
+              headers: headersForRecording,
+              body: null, // Remove old single body structure
+              chunks: recordedChunks // Store the array of base64 chunks
+            };
 
-            // Write recording asynchronously (don't wait)
-            writeRecording(recordingFilepath, { request: recordedRequest, response: recordedResponse })
+            // Write recording asynchronously
+            // Need to update writeRecording to handle this new structure
+            logInfo(`Recording ${recordedChunks.length} chunks for ${req.path}`)
+            writeRecording(recordingFilepath, { request: recordedRequest, response: recordedResponse });
 
-            // Send response back to client (using original headers and potentially decompressed body)
-            // Important: Use original headers before redaction/deletion for sending back
-            delete responseHeaders['content-encoding'] // Client shouldn't receive encoding if we decompressed
-            if (responseHeaders['content-length']) {
-               responseHeaders['content-length'] = Buffer.byteLength(decompressedBodyBuffer)
-            }
-            res.writeHead(responseStatus, responseHeaders)
-            res.end(decompressedBodyBuffer)
-          })
-          proxyRes.on('error', (error, req, res) => {
-            logError('Proxy Response Error:', error);
+            // Logging/Debug output (optional)
+            const logBody = completeBodyForLogging.toString('utf8').substring(0, 100) // Log first 100 chars
+            logInfo(`Finished proxying and recording for ${req.path}. Status: ${responseStatus}. Chunks: ${recordedChunks.length}. Start of body: ${logBody}...`)
+          });
+
+          proxyRes.on('error', (err) => {
+            logError(`Error receiving response from target for ${req.path}: ${err.message}`);
             if (!res.headersSent) {
-              res.writeHead(500, { 'Content-Type': 'text/plain' });
+              res.status(502).send('Proxy error: Upstream connection error');
+            } else {
+              // If headers already sent, we might need to signal error differently
+              res.end(); // End the response abruptly
             }
-            res.end('Proxy response error: ' + error.message);
-          })
+          });
         },
         onError: (err, req, res) => {
           logError('Proxy Error:', err);
