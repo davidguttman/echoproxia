@@ -14,7 +14,9 @@ const logError = debug('echoproxia:error')
 // --- Helper Functions ---
 function sanitizeFilename (filePath) {
   // Replace slashes and invalid chars; ensure it starts with '_'
-  return `_${filePath.replace(/^\//, '').replace(/[^a-zA-Z0-9_.-]/g, '_')}.json`
+  const baseName = `_${filePath.replace(/^\//, '').replace(/[^a-zA-Z0-9_.-]/g, '_')}`;
+  // Append the specific extension
+  return `${baseName}.echo.json`;
 }
 
 function redactHeaders (headers, headersToRedact) {
@@ -44,21 +46,19 @@ async function readRecordings (filePath) {
 }
 
 async function writeRecording (filePath, recording) {
-  const sequencePath = path.dirname(filePath)
+  const sequencePath = path.dirname(filePath); // e.g., __recordings__/my-test
   try {
     // Ensure the base directory for the sequence exists
-    await fs.mkdir(sequencePath, { recursive: true })
-    // Since setSequence now clears the directory in record mode,
-    // we don't read existing recordings anymore. We just write the new sequence.
-    // This assumes writeRecording is only called after setSequence in record mode,
-    // or that the initial sequence is also cleared on startup if in record mode.
-    // For simplicity, we'll start with just overwriting the specific file.
-    // A potential improvement: clear the whole dir on setSequence.
-    const recordings = [recording] // Start a new array with the current recording
-    await fs.writeFile(filePath, JSON.stringify(recordings, null, 2))
-    logInfo(`Recorded interaction to ${filePath} (overwriting existing file if present)`)
+    await fs.mkdir(sequencePath, { recursive: true });
+
+    // Create a new array containing only the current recording
+    const recordings = [recording];
+    // filePath will now end in .echo.json due to sanitizeFilename change
+    await fs.writeFile(filePath, JSON.stringify(recordings, null, 2));
+    // Updated log message slightly
+    logInfo(`Recorded interaction to ${filePath} (new file)`);
   } catch (error) {
-    logError(`Error writing recording to ${filePath}:`, error)
+    logError(`Error writing recording to ${filePath}:`, error);
   }
 }
 // --- End Helper Functions ---
@@ -83,15 +83,33 @@ async function createProxy (options = {}) {
   // --- End State ---
 
   // --- Initial Sequence Directory Cleanup (if in record mode) ---
-  // Added this block to handle the initial state before setSequence might be called
+  // Updated to only delete .echo.json files
   if (currentRecordMode) {
     const initialSequencePath = path.join(currentRecordingsDir, currentSequenceName);
-    logInfo(`Record mode active: Ensuring initial sequence directory is clear: ${initialSequencePath}`);
-    // Use fs.rm to delete the directory. force: true ignores 'not found' errors.
-    fs.rm(initialSequencePath, { recursive: true, force: true }).catch(err => {
-      // Log error if deletion fails for reasons other than 'not found'
-      logError(`Error clearing initial sequence directory ${initialSequencePath}:`, err);
-    });
+    logInfo(`Record mode active: Clearing initial *.echo.json files in: ${initialSequencePath}`);
+    // Use an async IIFE for non-blocking cleanup
+    (async () => {
+      try {
+        const filenames = await fs.readdir(initialSequencePath);
+        for (const filename of filenames) {
+          if (filename.endsWith('.echo.json')) { // TARGETED DELETION
+            const filePath = path.join(initialSequencePath, filename);
+            try {
+              await fs.unlink(filePath);
+              logInfo(`Deleted initial recording file: ${filePath}`);
+            } catch (unlinkErr) {
+              logError(`Error deleting initial file ${filePath}:`, unlinkErr);
+            }
+          }
+        }
+      } catch (err) {
+        if (err.code !== 'ENOENT') { // Ignore if dir doesn't exist
+           logError(`Error reading initial directory ${initialSequencePath} for cleanup:`, err);
+        } else {
+           logInfo(`Initial sequence directory ${initialSequencePath} does not exist, nothing to clear.`);
+        }
+      }
+    })(); // Fire-and-forget
   }
   // --- End Initial Cleanup ---
 
@@ -113,41 +131,78 @@ async function createProxy (options = {}) {
   })
 
   // --- Replay Function (scoped) ---
-  async function handleReplay (req, res, { recordingFilepath }) {
-    const sequenceRecordings = await readRecordings(recordingFilepath)
+  // Updated for backwards compatibility reading .json files
+  async function handleReplay (req, res, /* { other params } */ ) {
+    // 1. Construct NEW filename (.echo.json)
+    const recordingFilenameNew = sanitizeFilename(req.path); // Uses new .echo.json convention
+    const recordingFilepathNew = path.join(currentRecordingsDir, currentSequenceName, recordingFilenameNew);
+
+    // 2. Construct OLD filename (.json)
+    // Corrected the regex to properly escape dots
+    const recordingFilenameOld = recordingFilenameNew.replace(/\.echo\.json$/, '.json');
+    const recordingFilepathOld = path.join(currentRecordingsDir, currentSequenceName, recordingFilenameOld);
+
+    let sequenceRecordings = [];
+    let usedFilepath = ''; // Track which file was actually used
+
+    // 3. Attempt to read NEW format first
+    try {
+      logInfo(`Replay: Attempting to read new format: ${recordingFilepathNew}`);
+      sequenceRecordings = await readRecordings(recordingFilepathNew);
+      if (sequenceRecordings.length > 0) {
+         usedFilepath = recordingFilepathNew;
+         logInfo(`Replay: Using new format file: ${usedFilepath}`);
+      }
+    } catch (err) { /* Ignore read errors for now */ }
+
+    // 4. If NEW format is empty/missing, attempt to read OLD format
     if (sequenceRecordings.length === 0) {
-      logWarn(`Replay warning: Recording file not found or empty: ${recordingFilepath}`)
-      res.status(500).send(`Echoproxia Replay Error: No recording found for path ${req.path} in sequence ${currentSequenceName}.`)
-      return false // Indicate failure
+      try {
+        logInfo(`Replay: New format not found/empty, trying old format: ${recordingFilepathOld}`);
+        sequenceRecordings = await readRecordings(recordingFilepathOld);
+        if (sequenceRecordings.length > 0) {
+           usedFilepath = recordingFilepathOld;
+           logInfo(`Replay: Using old format file (backwards compat): ${usedFilepath}`);
+        }
+      } catch (err) { /* Ignore read errors */ }
     }
 
-    if (!replayCounters[currentSequenceName]) {
-      replayCounters[currentSequenceName] = {}
+    // 5. Check if any recordings were found
+    if (sequenceRecordings.length === 0) {
+      logWarn(`Replay warning: No recording file found or empty for path ${req.path} (checked ${recordingFilenameNew} and ${recordingFilenameOld})`);
+      res.status(500).send(`Echoproxia Replay Error: No recording found for path ${req.path} in sequence ${currentSequenceName}.`);
+      return false; // Indicate failure
     }
-    const sequenceReplayState = replayCounters[currentSequenceName]
-    const currentIndex = sequenceReplayState[recordingFilepath] || 0
+
+    // --- REMAINDER of handleReplay logic ---
+    // Use sequenceRecordings and usedFilepath for replay counter logic and serving response
+    if (!replayCounters[currentSequenceName]) {
+       replayCounters[currentSequenceName] = {};
+    }
+    // IMPORTANT: Use usedFilepath for the replay counter key!
+    const sequenceReplayState = replayCounters[currentSequenceName];
+    const currentIndex = sequenceReplayState[usedFilepath] || 0; // Keyed by actual file used
 
     if (currentIndex >= sequenceRecordings.length) {
-      logWarn(`Replay warning: Sequence exhausted for ${recordingFilepath}`)
-      res.status(500).send(`Echoproxia Replay Error: Sequence exhausted for path ${req.path} in sequence ${currentSequenceName}.`)
-      return false // Indicate failure
+       logWarn(`Replay warning: Sequence exhausted for ${usedFilepath}`);
+       res.status(500).send(`Echoproxia Replay Error: Sequence exhausted for path ${req.path} in sequence ${currentSequenceName} (file: ${usedFilepath}).`);
+       return false;
     }
 
-    const { response: recordedResponse } = sequenceRecordings[currentIndex]
-    sequenceReplayState[recordingFilepath] = currentIndex + 1 // Increment counter
+    const { response: recordedResponse } = sequenceRecordings[currentIndex];
+    // IMPORTANT: Update counter using usedFilepath
+    sequenceReplayState[usedFilepath] = currentIndex + 1;
 
-    // --- Streaming Replay Refactor ---
+    // --- Streaming Replay Refactor --- (Keep existing streaming logic)
     if (!recordedResponse.chunks || !Array.isArray(recordedResponse.chunks)) {
-      logError(`Replay Error: Recording at index ${currentIndex} for ${recordingFilepath} is missing or has invalid 'chunks' format.`)
-      res.status(500).send(`Echoproxia Replay Error: Invalid recording format for path ${req.path} in sequence ${currentSequenceName}.`)
-      return false // Indicate failure
+      logError(`Replay Error: Recording at index ${currentIndex} for ${usedFilepath} is missing or has invalid 'chunks' format.`);
+      res.status(500).send(`Echoproxia Replay Error: Invalid recording format for path ${req.path} in sequence ${currentSequenceName}.`);
+      return false; // Indicate failure
     }
 
     // 1. Send Headers
     res.status(recordedResponse.status);
     Object.entries(recordedResponse.headers).forEach(([key, value]) => {
-      // Filter out problematic headers for replay, e.g., content-length calculated per chunk
-      // Transfer-Encoding: chunked is usually handled by Node automatically when streaming
       const lowerKey = key.toLowerCase();
       if (lowerKey !== 'content-length' && lowerKey !== 'transfer-encoding') {
           try {
@@ -157,27 +212,25 @@ async function createProxy (options = {}) {
           }
       }
     });
-    // Send headers before body/chunks
     res.writeHead(recordedResponse.status);
 
     // 2. Stream Chunks
     for (const base64Chunk of recordedResponse.chunks) {
       try {
         const chunkBuffer = Buffer.from(base64Chunk, 'base64');
-        res.write(chunkBuffer); // Write chunk to client
+        res.write(chunkBuffer);
       } catch (decodeErr) {
-        logError(`Replay Error: Failed to decode base64 chunk at index ${currentIndex} for ${recordingFilepath}: ${decodeErr.message}`);
-        // Decide how to handle: stop replay? send error? For now, we stop.
-        res.end(); // End response abruptly on error
-        return false; // Indicate failure
+        logError(`Replay Error: Failed to decode base64 chunk at index ${currentIndex} for ${usedFilepath}: ${decodeErr.message}`);
+        res.end();
+        return false;
       }
     }
 
     // 3. End Stream
-    res.end(); // Signal end of stream after all chunks are sent
+    res.end();
 
-    logInfo(`Replayed ${recordedResponse.chunks.length} chunks from ${recordingFilepath} at index ${currentIndex}`)
-    return true // Indicate success
+    logInfo(`Replayed interaction ${currentIndex + 1}/${sequenceRecordings.length} from ${usedFilepath}`);
+    return true; // Indicate success
   }
 
   // --- Proxy Middleware Setup ---
@@ -192,18 +245,20 @@ async function createProxy (options = {}) {
       return next()
     }
 
-    const recordingFilename = sanitizeFilename(req.path)
-    const recordingFilepath = path.join(currentRecordingsDir, currentSequenceName, recordingFilename)
+    // Note: handleReplay now internally determines the correct file path (.echo.json or .json)
+    // We don't need to pass recordingFilepath directly anymore if handleReplay is self-contained
+    // const recordingFilename = sanitizeFilename(req.path);
+    // const recordingFilepath = path.join(currentRecordingsDir, currentSequenceName, recordingFilename);
 
     if (!currentRecordMode) {
       // Replay Mode
-      const replayed = await handleReplay(req, res, { recordingFilepath })
+      // Pass necessary context, handleReplay finds the file
+      const replayed = await handleReplay(req, res, { /* other context if needed */ })
       if (!replayed && !res.headersSent) {
-        // handleReplay already sent 500, but if somehow it didn't...
         logError('Replay failed unexpectedly without sending response.')
         res.status(500).send('Internal Echoproxia Replay Error.')
       }
-      // Don't call next() in replay mode, response is handled or error sent
+      // Don't call next()
     } else {
       // Record Mode - Create and call the proxy middleware instance
       const proxyMiddlewareInstance = createProxyMiddleware({
@@ -270,9 +325,7 @@ async function createProxy (options = {}) {
               chunks: recordedChunks // Store the array of base64 chunks
             };
 
-            // Write recording asynchronously
-            // Need to update writeRecording to handle this new structure
-            logInfo(`Recording ${recordedChunks.length} chunks for ${req.path}`)
+            logInfo(`Recording ${recordedChunks.length} chunks for ${req.path} to ${recordingFilename}`) // Log new filename
             writeRecording(recordingFilepath, { request: recordedRequest, response: recordedResponse });
 
             // Logging/Debug output (optional)
@@ -298,7 +351,6 @@ async function createProxy (options = {}) {
           res.end('Proxy error: ' + err.message);
         }
       })
-      // Now call the created middleware instance
       proxyMiddlewareInstance(req, res, next)
     }
   })
@@ -316,26 +368,41 @@ async function createProxy (options = {}) {
           port: actualPort,
           url: `http://localhost:${actualPort}`,
           server: runningServer,
-          setSequence: async (sequenceName) => { // Make async
-            // --- Sequence Directory Cleanup Logic ---
-            if (currentRecordMode) {
+          setSequence: async (sequenceName) => { // Keep async
+            // --- Sequence Recording Cleanup Logic --- (Uses currentRecordMode for now)
+            // This logic will be updated in the next tutorial (03) for overrides
+            const effectiveMode = currentRecordMode; // Placeholder for now
+
+            if (effectiveMode === true) { // Only clear if effective mode is record
               const sequencePath = path.join(currentRecordingsDir, sequenceName);
-              logInfo(`Record mode active: Clearing sequence directory before setting: ${sequencePath}`);
+              logInfo(`Effective mode is 'record': Clearing *.echo.json files in: ${sequencePath}`);
               try {
-                // Use fs.rm to delete the directory. force: true ignores 'not found' errors.
-                await fs.rm(sequencePath, { recursive: true, force: true });
+                const filenames = await fs.readdir(sequencePath);
+                for (const filename of filenames) {
+                  // --- TARGETED DELETION ---
+                  if (filename.endsWith('.echo.json')) {
+                    const filePath = path.join(sequencePath, filename);
+                    try {
+                      await fs.unlink(filePath);
+                      logInfo(`Deleted recording file: ${filePath}`);
+                    } catch (unlinkErr) {
+                       logError(`Error deleting file ${filePath}:`, unlinkErr);
+                    }
+                  }
+                }
               } catch (err) {
-                // Log error if deletion fails for reasons other than 'not found'
-                logError(`Error clearing sequence directory ${sequencePath}:`, err);
-                // Decide if we should proceed or throw/reject? For now, just log.
+                if (err.code === 'ENOENT') {
+                  logInfo(`Sequence directory ${sequencePath} does not exist, nothing to clear.`);
+                } else {
+                  logError(`Error reading sequence directory ${sequencePath} for cleanup:`, err);
+                }
               }
             }
             // --- End Cleanup Logic ---
 
             currentSequenceName = sequenceName
             logInfo(`Sequence set to: ${currentSequenceName}`)
-            // Reset replay counters for the (potentially new) sequence
-            replayCounters[currentSequenceName] = {}
+            replayCounters[currentSequenceName] = {} // Reset replay state
           },
           // Add setMode, setTargetUrl etc. if needed for runtime changes
           stop: async () => {

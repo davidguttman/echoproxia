@@ -9,6 +9,9 @@ const getPort = require('get-port')
 const { createProxy } = require('../src/index') // Import the actual module interface
 
 const TEST_RECORDINGS_DIR = path.join(__dirname, '__test_recordings__')
+// Define expected extensions
+const NEW_EXTENSION = '.echo.json'
+const OLD_EXTENSION = '.json'
 
 // Helper function to wait for file existence
 async function waitForFile (filePath, timeoutMs = 2000, intervalMs = 100) {
@@ -104,7 +107,8 @@ test.serial('Record Mode: should proxy request and save recording', async t => {
   const sequenceName = 'test-record-sequence'
   const requestPath = '/get'
   const requestQuery = '?query=1&param=value'
-  const recordingFilePath = path.join(TEST_RECORDINGS_DIR, sequenceName, '_get.json')
+  const sanitizedBase = `_${requestPath.replace(/^\//, '')}`
+  const recordingFilePath = path.join(TEST_RECORDINGS_DIR, sequenceName, `${sanitizedBase}${NEW_EXTENSION}`)
 
   // Start proxy in record mode
   t.context.proxy = await createProxy({
@@ -149,11 +153,13 @@ test.serial('Record Mode: should proxy request and save recording', async t => {
     t.is(recordings.length, 1, 'Should have one recording')
     const recorded = recordings[0]
     t.is(recorded.request.method, 'GET')
-    t.is(recorded.request.path, requestPath) // Check path too
+    t.is(recorded.request.path, requestPath)
     t.is(recorded.response.status, 200)
-    // Add a check for response body structure if needed
-    t.deepEqual(recorded.response.body.data, JSON.stringify({ message: 'mock get success', query: { query: '1', param: 'value' } }))
-    t.is(recorded.response.body.encoding, 'utf8') // Assuming UTF-8 for JSON
+    const expectedResponseJson = JSON.stringify({ message: 'mock get success', query: { query: '1', param: 'value' } })
+    const expectedChunk = Buffer.from(expectedResponseJson).toString('base64')
+    t.truthy(Array.isArray(recorded.response.chunks), 'Response should have chunks array')
+    t.is(recorded.response.chunks.length, 1, 'Response should have one chunk for simple JSON')
+    t.is(recorded.response.chunks[0], expectedChunk, 'Recorded chunk content should match expected')
   } catch (e) {
     t.log('Failed to read/parse/validate recording', e)
     t.fail(`Recording content validation failed: ${e.message}`)
@@ -242,4 +248,206 @@ test.serial('Replay Mode: should replay interaction and handle exhaustion', asyn
 
   // Assert mock target was STILL NOT hit
   t.is(lastMockRequest, null, 'Mock target should still NOT have been hit')
-}) 
+})
+
+test.serial('Record Mode: should proxy request and save recording with .echo.json extension', async t => {
+  const sequenceName = 'test-record-sequence-new-ext'
+  const requestPath = '/get'
+  const requestQuery = '?ext=echo'
+  // Use new sanitize logic to predict filename
+  const sanitizedBase = `_${requestPath.replace(/^\//, '')}` // -> '_get'
+  const recordingFilePath = path.join(TEST_RECORDINGS_DIR, sequenceName, `${sanitizedBase}${NEW_EXTENSION}`) // -> .../_get.echo.json
+
+  t.context.proxy = await createProxy({
+    recordMode: true,
+    targetUrl: MOCK_TARGET_URL,
+    recordingsDir: TEST_RECORDINGS_DIR
+  })
+  t.context.proxy.setSequence(sequenceName)
+
+  const proxyResponse = await axios.get(`${t.context.proxy.url}${requestPath}${requestQuery}`)
+
+  t.is(proxyResponse.status, 200)
+  t.truthy(lastMockRequest, 'Mock target should have received a request')
+
+  const fileExists = await waitForFile(recordingFilePath)
+  t.true(fileExists, `Recording file ${recordingFilePath} should be created`)
+
+  // Assert content (simplified)
+  try {
+    const recordings = JSON.parse(await fs.readFile(recordingFilePath, 'utf8'))
+    t.is(recordings.length, 1, 'Should have one recording')
+    t.is(recordings[0].request.path, requestPath)
+    t.is(recordings[0].response.status, 200)
+  } catch (e) {
+    t.fail(`Recording content validation failed: ${e.message}`)
+  }
+})
+
+// --- Tests for Cleanup Logic --- 
+
+test.serial('Record Mode: setSequence should clear only .echo.json files', async t => {
+  const sequenceName = 'test-cleanup-sequence'
+  const sequencePath = path.join(TEST_RECORDINGS_DIR, sequenceName)
+  const fileToClear = path.join(sequencePath, `_test${NEW_EXTENSION}`)
+  const fileToKeepJson = path.join(sequencePath, `_test${OLD_EXTENSION}`)
+  const fileToKeepOther = path.join(sequencePath, '_test.other.txt')
+
+  // Setup: Create sequence dir and files
+  await fs.mkdir(sequencePath, { recursive: true })
+  await fs.writeFile(fileToClear, '[]')
+  await fs.writeFile(fileToKeepJson, '[]')
+  await fs.writeFile(fileToKeepOther, 'some text')
+
+  // Check initial state
+  await t.notThrowsAsync(fs.access(fileToClear), 'Expected .echo.json to exist initially')
+  await t.notThrowsAsync(fs.access(fileToKeepJson), 'Expected .json to exist initially')
+  await t.notThrowsAsync(fs.access(fileToKeepOther), 'Expected .other.txt to exist initially')
+
+  // Start proxy and set sequence
+  t.context.proxy = await createProxy({
+    recordMode: true,
+    targetUrl: MOCK_TARGET_URL,
+    recordingsDir: TEST_RECORDINGS_DIR
+  })
+  await t.context.proxy.setSequence(sequenceName) // Use await as setSequence is async
+
+  // Assert state after setSequence
+  await t.throwsAsync(fs.access(fileToClear), { code: 'ENOENT' }, 'Expected .echo.json to be deleted')
+  await t.notThrowsAsync(fs.access(fileToKeepJson), 'Expected .json to be kept')
+  await t.notThrowsAsync(fs.access(fileToKeepOther), 'Expected .other.txt to be kept')
+});
+
+test.serial('Record Mode: Initial startup should clear only .echo.json from default sequence', async t => {
+  const defaultSequenceName = 'default-sequence' // Match default in src/index.js
+  const sequencePath = path.join(TEST_RECORDINGS_DIR, defaultSequenceName)
+  const fileToClear = path.join(sequencePath, `_initial${NEW_EXTENSION}`)
+  const fileToKeepJson = path.join(sequencePath, `_initial${OLD_EXTENSION}`)
+  const fileToKeepOther = path.join(sequencePath, '_initial.other.txt')
+
+  // Setup: Create default sequence dir and files BEFORE starting proxy
+  await fs.mkdir(sequencePath, { recursive: true })
+  await fs.writeFile(fileToClear, '[]')
+  await fs.writeFile(fileToKeepJson, '[]')
+  await fs.writeFile(fileToKeepOther, 'some text')
+
+  // Check initial state
+  await t.notThrowsAsync(fs.access(fileToClear), 'Expected .echo.json to exist before startup')
+  await t.notThrowsAsync(fs.access(fileToKeepJson), 'Expected .json to exist before startup')
+  await t.notThrowsAsync(fs.access(fileToKeepOther), 'Expected .other.txt to exist before startup')
+
+  // Start proxy in record mode (initial cleanup happens here)
+  t.context.proxy = await createProxy({
+    recordMode: true,
+    targetUrl: MOCK_TARGET_URL,
+    recordingsDir: TEST_RECORDINGS_DIR,
+    defaultSequenceName: defaultSequenceName // Explicitly pass for clarity
+  })
+
+  // Assert state after startup (give a brief moment for async cleanup)
+  await new Promise(resolve => setTimeout(resolve, 100)) // Small delay for async fs.rm
+
+  await t.throwsAsync(fs.access(fileToClear), { code: 'ENOENT' }, 'Expected .echo.json to be deleted by startup')
+  await t.notThrowsAsync(fs.access(fileToKeepJson), 'Expected .json to be kept after startup')
+  await t.notThrowsAsync(fs.access(fileToKeepOther), 'Expected .other.txt to be kept after startup')
+});
+
+// --- Tests for Backwards Compatibility --- 
+
+test.serial('Replay Mode: Backwards Compatibility', async t => {
+  const sequenceName = 'test-backwards-compat'
+  const requestPath = '/replay-compat'
+  const sequencePath = path.join(TEST_RECORDINGS_DIR, sequenceName)
+  const baseFilename = `_${requestPath.replace(/^\//, '')}` // -> '_replay-compat' 
+  const newFilePath = path.join(sequencePath, `${baseFilename}${NEW_EXTENSION}`)
+  const oldFilePath = path.join(sequencePath, `${baseFilename}${OLD_EXTENSION}`)
+
+  // Helper to create a recording file
+  const createRecording = async (filePath, responseData) => {
+    const content = [{
+      request: { method: 'GET', path: requestPath, /* ... */ },
+      response: {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        chunks: [Buffer.from(JSON.stringify(responseData)).toString('base64')] // Simplified chunk
+      }
+    }]
+    await fs.mkdir(path.dirname(filePath), { recursive: true })
+    await fs.writeFile(filePath, JSON.stringify(content, null, 2))
+  }
+
+  // Sub-test function
+  const runReplayTest = async (setupFn, expectedData, description) => {
+    // Clean and setup for sub-test
+    await new Promise((resolve, reject) => rimraf(sequencePath, err => err ? reject(err) : resolve()))
+    await setupFn()
+
+    // Start proxy in replay mode
+    const proxy = await createProxy({
+      recordMode: false,
+      targetUrl: MOCK_TARGET_URL, // Should not be hit
+      recordingsDir: TEST_RECORDINGS_DIR
+    })
+    await proxy.setSequence(sequenceName) // Use await
+
+    lastMockRequest = null // Ensure target is not hit
+    let response
+    try {
+      response = await axios.get(`${proxy.url}${requestPath}`)
+    } finally {
+      await proxy.stop()
+    }
+
+    t.is(lastMockRequest, null, `${description}: Mock target should not be hit`)
+    t.is(response.status, 200, `${description}: Should get 200 status`)
+    t.deepEqual(response.data, expectedData, `${description}: Response data should match expected`)
+  }
+
+  // Test 1: Only .echo.json exists
+  const dataNew = { source: 'new format .echo.json' }
+  await runReplayTest(
+    async () => createRecording(newFilePath, dataNew),
+    dataNew,
+    'New format only'
+  )
+
+  // Test 2: Only .json exists
+  const dataOld = { source: 'old format .json' }
+  await runReplayTest(
+    async () => createRecording(oldFilePath, dataOld),
+    dataOld,
+    'Old format only'
+  )
+
+  // Test 3: Both exist (.echo.json should take precedence)
+  const dataBothNew = { source: 'new format when both exist' }
+  const dataBothOld = { source: 'old format when both exist' }
+  await runReplayTest(
+    async () => {
+      await createRecording(newFilePath, dataBothNew)
+      await createRecording(oldFilePath, dataBothOld)
+    },
+    dataBothNew, // Expect data from .echo.json
+    'Both formats exist'
+  )
+
+  // Test 4: Neither exists
+  await new Promise((resolve, reject) => rimraf(sequencePath, err => err ? reject(err) : resolve())) // Ensure clean slate
+  const proxyNeither = await createProxy({
+    recordMode: false,
+    targetUrl: MOCK_TARGET_URL,
+    recordingsDir: TEST_RECORDINGS_DIR
+  })
+  await proxyNeither.setSequence(sequenceName)
+  lastMockRequest = null
+  try {
+    await axios.get(`${proxyNeither.url}${requestPath}`)
+    t.fail('Neither format: Should have failed')
+  } catch (error) {
+    t.is(lastMockRequest, null, 'Neither format: Mock target should not be hit')
+    t.is(error.response?.status, 500, 'Neither format: Should fail with 500')
+    t.truthy(error.response?.data?.includes('No recording found'), 'Neither format: Error message should indicate not found')
+  } finally {
+    await proxyNeither.stop()
+  }
+}); 
