@@ -1,6 +1,6 @@
 {
   "name": "echoproxia",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Echoproxia provides a simple Express-based HTTP proxy server designed for recording and replaying HTTP interactions during testing. It allows dynamically switching between different recording sequences (e.g., for different tests or test steps) while the server is running.",
   "main": "src/index.js",
   "scripts": {
