@@ -451,3 +451,163 @@ test.serial('Replay Mode: Backwards Compatibility', async t => {
     await proxyNeither.stop()
   }
 }); 
+
+// --- Tests for setSequence RecordMode Override ---
+
+test.serial('Override: Global Record, Sequence Replay -> Should Replay', async t => {
+  const sequenceName = 'override-global-record-seq-replay'
+  const requestPath = '/get'
+  const dummyRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_get${NEW_EXTENSION}`)
+  const dummyReplayData = [{ request: {}, response: { status: 299, headers: { 'x-replayed': 'true' }, chunks: [Buffer.from(JSON.stringify({ replay: 'override-works' })).toString('base64')] } }]
+
+  // Prepare dummy recording
+  await fs.mkdir(path.dirname(dummyRecordingFile), { recursive: true })
+  await fs.writeFile(dummyRecordingFile, JSON.stringify(dummyReplayData, null, 2))
+
+  // Start proxy in GLOBAL RECORD mode
+  t.context.proxy = await createProxy({
+    recordMode: true,
+    targetUrl: MOCK_TARGET_URL,
+    recordingsDir: TEST_RECORDINGS_DIR,
+    defaultSequenceName: 'should-not-be-used'
+  })
+  t.truthy(t.context.proxy, 'Proxy instance should be created')
+
+  lastMockRequest = null // Reset mock state
+
+  // Set sequence, OVERRIDING to REPLAY mode
+  await t.context.proxy.setSequence(sequenceName, { recordMode: false })
+
+  // Make request
+  const response = await axios.get(`${t.context.proxy.url}${requestPath}`)
+
+  // Assert response came from dummy recording (replay)
+  t.is(response.status, 299)
+  t.is(response.headers['x-replayed'], 'true')
+  t.deepEqual(response.data, { replay: 'override-works' })
+
+  // Assert mock target was NOT hit
+  t.is(lastMockRequest, null, 'Mock target should NOT have been hit during forced replay')
+});
+
+test.serial('Override: Global Replay, Sequence Record -> Should Record', async t => {
+  const sequenceName = 'override-global-replay-seq-record'
+  const requestPath = '/post'
+  const requestBody = { record: 'this' }
+  const expectedRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_post${NEW_EXTENSION}`)
+
+  // Start proxy in GLOBAL REPLAY mode
+  t.context.proxy = await createProxy({
+    recordMode: false,
+    targetUrl: MOCK_TARGET_URL, // Target needed for recording
+    recordingsDir: TEST_RECORDINGS_DIR,
+    defaultSequenceName: 'should-not-be-used'
+  })
+  t.truthy(t.context.proxy, 'Proxy instance should be created')
+
+  lastMockRequest = null // Reset mock state
+
+  // Set sequence, OVERRIDING to RECORD mode
+  await t.context.proxy.setSequence(sequenceName, { recordMode: true })
+
+  // Make request
+  const response = await axios.post(`${t.context.proxy.url}${requestPath}`, requestBody)
+
+  // Assert response came from mock server (recording)
+  t.is(response.status, 201)
+  t.deepEqual(response.data, { message: 'mock post success', received_body: requestBody })
+
+  // Assert mock target WAS hit
+  t.truthy(lastMockRequest, 'Mock target should have been hit during forced record')
+  t.is(lastMockRequest.method, 'POST')
+  t.is(lastMockRequest.path, requestPath)
+
+  // Assert recording file was created
+  const fileExists = await waitForFile(expectedRecordingFile)
+  t.true(fileExists, 'Recording file should be created due to override')
+  try {
+    const recordings = JSON.parse(await fs.readFile(expectedRecordingFile, 'utf8'))
+    t.is(recordings.length, 1, 'Should have one recording')
+    t.is(recordings[0].request.method, 'POST')
+    t.is(recordings[0].response.status, 201)
+  } catch (e) {
+    t.fail(`Failed to validate recording content: ${e.message}`)
+  }
+});
+
+test.serial('Override: Global Record, No Override -> Should Record', async t => {
+  const sequenceName = 'no-override-global-record-seq-record'
+  const requestPath = '/get'
+  const requestQuery = '?default=record'
+  const expectedRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_get${NEW_EXTENSION}`)
+
+  // Start proxy in GLOBAL RECORD mode
+  t.context.proxy = await createProxy({
+    recordMode: true,
+    targetUrl: MOCK_TARGET_URL,
+    recordingsDir: TEST_RECORDINGS_DIR,
+    defaultSequenceName: 'should-not-be-used'
+  })
+  t.truthy(t.context.proxy, 'Proxy instance should be created')
+
+  lastMockRequest = null // Reset mock state
+
+  // Set sequence, using default global RECORD mode
+  await t.context.proxy.setSequence(sequenceName)
+
+  // Make request
+  const response = await axios.get(`${t.context.proxy.url}${requestPath}${requestQuery}`)
+
+  // Assert response came from mock server (recording)
+  t.is(response.status, 200)
+  t.deepEqual(response.data, { message: 'mock get success', query: { default: 'record' } })
+
+  // Assert mock target WAS hit
+  t.truthy(lastMockRequest, 'Mock target should have been hit during default record')
+  t.is(lastMockRequest.method, 'GET')
+  t.is(lastMockRequest.path, `${requestPath}${requestQuery}`)
+
+  // Assert recording file was created
+  const fileExists = await waitForFile(expectedRecordingFile)
+  t.true(fileExists, 'Recording file should be created when using default global record mode')
+});
+
+test.serial('Override: Global Replay, No Override -> Should Replay', async t => {
+  const sequenceName = 'no-override-global-replay-seq-replay'
+  const requestPath = '/post'
+  const requestBody = { default: 'replay' }
+  const dummyRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_post${NEW_EXTENSION}`)
+  const dummyReplayData = [{ request: {}, response: { status: 298, headers: { 'x-replayed-default': 'true' }, chunks: [Buffer.from(JSON.stringify({ replay: 'default-replay' })).toString('base64')] } }]
+
+  // Prepare dummy recording
+  await fs.mkdir(path.dirname(dummyRecordingFile), { recursive: true })
+  await fs.writeFile(dummyRecordingFile, JSON.stringify(dummyReplayData, null, 2))
+
+  // Start proxy in GLOBAL REPLAY mode
+  t.context.proxy = await createProxy({
+    recordMode: false,
+    targetUrl: 'http://should-not-be-hit.invalid',
+    recordingsDir: TEST_RECORDINGS_DIR,
+    defaultSequenceName: 'should-not-be-used'
+  })
+  t.truthy(t.context.proxy, 'Proxy instance should be created')
+
+  lastMockRequest = null // Reset mock state
+
+  // Set sequence, using default global REPLAY mode
+  await t.context.proxy.setSequence(sequenceName)
+
+  // Make request
+  const response = await axios.post(`${t.context.proxy.url}${requestPath}`, requestBody)
+
+  // Assert response came from dummy recording (replay)
+  t.is(response.status, 298)
+  t.is(response.headers['x-replayed-default'], 'true')
+  t.deepEqual(response.data, { replay: 'default-replay' })
+
+  // Assert mock target was NOT hit
+  t.is(lastMockRequest, null, 'Mock target should NOT have been hit during default replay')
+});
+
+// --- Tests for Recording File Format & Cleanup ---
+// ... existing code ... 

@@ -1,0 +1,14 @@
+[
+  {
+    "request": {},
+    "response": {
+      "status": 298,
+      "headers": {
+        "x-replayed-default": "true"
+      },
+      "chunks": [
+        "eyJyZXBsYXkiOiJkZWZhdWx0LXJlcGxheSJ9"
+      ]
+    }
+  }
+]

@@ -308,7 +308,8 @@ async function createProxy (options = {}) {
     // const recordingFilename = sanitizeFilename(req.path);
     // const recordingFilepath = path.join(currentRecordingsDir, currentSequenceName, recordingFilename);
 
-    if (!currentRecordMode) {
+    // Use the EFFECTIVE mode for the currently active sequence
+    if (activeSequenceEffectiveMode === false) {
       // Replay Mode
       // Pass necessary context, handleReplay finds the file
       const replayed = await handleReplay(req, res, { /* other context if needed */ })
