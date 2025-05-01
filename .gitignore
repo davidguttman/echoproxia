@@ -1,2 +1,4 @@
 __example_recordings__/
 node_modules/
+# SpecStory explanation file
+.specstory/.what-is-this.md

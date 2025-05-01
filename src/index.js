@@ -46,11 +46,17 @@ async function readRecordings (filePath) {
 async function writeRecording (filePath, recording) {
   const sequencePath = path.dirname(filePath)
   try {
+    // Ensure the base directory for the sequence exists
     await fs.mkdir(sequencePath, { recursive: true })
-    const recordings = await readRecordings(filePath)
-    recordings.push(recording)
+    // Since setSequence now clears the directory in record mode,
+    // we don't read existing recordings anymore. We just write the new sequence.
+    // This assumes writeRecording is only called after setSequence in record mode,
+    // or that the initial sequence is also cleared on startup if in record mode.
+    // For simplicity, we'll start with just overwriting the specific file.
+    // A potential improvement: clear the whole dir on setSequence.
+    const recordings = [recording] // Start a new array with the current recording
     await fs.writeFile(filePath, JSON.stringify(recordings, null, 2))
-    logInfo(`Recorded interaction to ${filePath}`)
+    logInfo(`Recorded interaction to ${filePath} (overwriting existing file if present)`)
   } catch (error) {
     logError(`Error writing recording to ${filePath}:`, error)
   }
@@ -75,6 +81,19 @@ async function createProxy (options = {}) {
   const headersToRedact = headersToRedactInput.map(h => h.toLowerCase())
   let runningServer = null
   // --- End State ---
+
+  // --- Initial Sequence Directory Cleanup (if in record mode) ---
+  // Added this block to handle the initial state before setSequence might be called
+  if (currentRecordMode) {
+    const initialSequencePath = path.join(currentRecordingsDir, currentSequenceName);
+    logInfo(`Record mode active: Ensuring initial sequence directory is clear: ${initialSequencePath}`);
+    // Use fs.rm to delete the directory. force: true ignores 'not found' errors.
+    fs.rm(initialSequencePath, { recursive: true, force: true }).catch(err => {
+      // Log error if deletion fails for reasons other than 'not found'
+      logError(`Error clearing initial sequence directory ${initialSequencePath}:`, err);
+    });
+  }
+  // --- End Initial Cleanup ---
 
   const app = express()
 
@@ -297,12 +316,26 @@ async function createProxy (options = {}) {
           port: actualPort,
           url: `http://localhost:${actualPort}`,
           server: runningServer,
-          setSequence: (sequenceName) => {
+          setSequence: async (sequenceName) => { // Make async
+            // --- Sequence Directory Cleanup Logic ---
+            if (currentRecordMode) {
+              const sequencePath = path.join(currentRecordingsDir, sequenceName);
+              logInfo(`Record mode active: Clearing sequence directory before setting: ${sequencePath}`);
+              try {
+                // Use fs.rm to delete the directory. force: true ignores 'not found' errors.
+                await fs.rm(sequencePath, { recursive: true, force: true });
+              } catch (err) {
+                // Log error if deletion fails for reasons other than 'not found'
+                logError(`Error clearing sequence directory ${sequencePath}:`, err);
+                // Decide if we should proceed or throw/reject? For now, just log.
+              }
+            }
+            // --- End Cleanup Logic ---
+
             currentSequenceName = sequenceName
             logInfo(`Sequence set to: ${currentSequenceName}`)
-            if (!replayCounters[currentSequenceName]) {
-              replayCounters[currentSequenceName] = {}
-            }
+            // Reset replay counters for the (potentially new) sequence
+            replayCounters[currentSequenceName] = {}
           },
           // Add setMode, setTargetUrl etc. if needed for runtime changes
           stop: async () => {
