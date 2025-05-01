@@ -82,8 +82,11 @@ async function createProxy (options = {}) {
   let runningServer = null
   // --- End State ---
 
+  // --- New State Variable ---
+  let activeSequenceEffectiveMode = currentRecordMode // Initialize with global mode
+  // --- End New State Variable ---
+
   // --- Initial Sequence Directory Cleanup (if in record mode) ---
-  // Updated to only delete .echo.json files
   if (currentRecordMode) {
     const initialSequencePath = path.join(currentRecordingsDir, currentSequenceName);
     logInfo(`Record mode active: Clearing initial *.echo.json files in: ${initialSequencePath}`);
@@ -129,6 +132,61 @@ async function createProxy (options = {}) {
     }
     res.status(200).send(`Sequence set to ${currentSequenceName}`)
   })
+
+  // --- Internal setSequence Function ---
+  // Moved from the returned object to be internal, accepting options
+  const internalSetSequence = async (sequenceName, options = {}) => {
+    const { recordMode: sequenceOverrideMode } = options // Get override boolean
+
+    // Determine the effective mode for this sequence activation
+    // Use override if provided (true/false), otherwise use global (currentRecordMode)
+    const effectiveMode = typeof sequenceOverrideMode === 'boolean'
+      ? sequenceOverrideMode
+      : currentRecordMode // Use global mode as fallback
+
+    logInfo(`Setting sequence: ${sequenceName}, GlobalMode: ${currentRecordMode}, Override: ${sequenceOverrideMode}, EffectiveMode: ${effectiveMode ? 'record' : 'replay'}`)
+
+    // --- Sequence Recording Cleanup Logic (Uses effectiveMode) ---
+    if (effectiveMode === true) { // Only clear if effective mode is record
+      const sequencePath = path.join(currentRecordingsDir, sequenceName)
+      logInfo(`Effective mode is 'record': Clearing *.echo.json files in: ${sequencePath}`)
+      try {
+        const filenames = await fs.readdir(sequencePath)
+        for (const filename of filenames) {
+          if (filename.endsWith('.echo.json')) { // Target specific files
+            const filePath = path.join(sequencePath, filename)
+            try {
+              await fs.unlink(filePath)
+              logInfo(`Deleted recording file: ${filePath}`)
+            } catch (unlinkErr) {
+               logError(`Error deleting file ${filePath}:`, unlinkErr)
+            }
+          }
+        }
+      } catch (err) {
+        if (err.code === 'ENOENT') {
+          logInfo(`Sequence directory ${sequencePath} does not exist, nothing to clear.`)
+        } else {
+          logError(`Error reading sequence directory ${sequencePath} for cleanup:`, err)
+        }
+      }
+    } else {
+      logInfo(`Effective mode is 'replay': Skipping cleanup for ${sequenceName}`)
+    }
+    // --- End Cleanup Logic ---
+
+    // Store the determined effective mode for the main handler
+    activeSequenceEffectiveMode = effectiveMode
+
+    // Original logic to set the name and reset counters
+    currentSequenceName = sequenceName
+    logInfo(`Sequence set to: ${currentSequenceName}`)
+    // Ensure replayCounters exist for the sequence
+    if (!replayCounters[currentSequenceName]) {
+      replayCounters[currentSequenceName] = {}
+    }
+  }
+  // --- End Internal setSequence Function ---
 
   // --- Replay Function (scoped) ---
   // Updated for backwards compatibility reading .json files
@@ -368,41 +426,9 @@ async function createProxy (options = {}) {
           port: actualPort,
           url: `http://localhost:${actualPort}`,
           server: runningServer,
-          setSequence: async (sequenceName) => { // Keep async
-            // --- Sequence Recording Cleanup Logic --- (Uses currentRecordMode for now)
-            // This logic will be updated in the next tutorial (03) for overrides
-            const effectiveMode = currentRecordMode; // Placeholder for now
-
-            if (effectiveMode === true) { // Only clear if effective mode is record
-              const sequencePath = path.join(currentRecordingsDir, sequenceName);
-              logInfo(`Effective mode is 'record': Clearing *.echo.json files in: ${sequencePath}`);
-              try {
-                const filenames = await fs.readdir(sequencePath);
-                for (const filename of filenames) {
-                  // --- TARGETED DELETION ---
-                  if (filename.endsWith('.echo.json')) {
-                    const filePath = path.join(sequencePath, filename);
-                    try {
-                      await fs.unlink(filePath);
-                      logInfo(`Deleted recording file: ${filePath}`);
-                    } catch (unlinkErr) {
-                       logError(`Error deleting file ${filePath}:`, unlinkErr);
-                    }
-                  }
-                }
-              } catch (err) {
-                if (err.code === 'ENOENT') {
-                  logInfo(`Sequence directory ${sequencePath} does not exist, nothing to clear.`);
-                } else {
-                  logError(`Error reading sequence directory ${sequencePath} for cleanup:`, err);
-                }
-              }
-            }
-            // --- End Cleanup Logic ---
-
-            currentSequenceName = sequenceName
-            logInfo(`Sequence set to: ${currentSequenceName}`)
-            replayCounters[currentSequenceName] = {} // Reset replay state
+          setSequence: async (sequenceName, sequenceOptions = {}) => { // Keep async
+            // Await the internal function which handles async cleanup
+            await internalSetSequence(sequenceName, sequenceOptions)
           },
           // Add setMode, setTargetUrl etc. if needed for runtime changes
           stop: async () => {
