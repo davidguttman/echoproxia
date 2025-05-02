@@ -610,4 +610,91 @@ test.serial('Override: Global Replay, No Override -> Should Replay', async t => 
 });
 
 // --- Tests for Recording File Format & Cleanup ---
-// ... existing code ... 
+
+// --- Tests for includePlainTextBody Option ---
+
+test.serial('Record Mode: includePlainTextBody: true -> should add bodyPlainText', async t => {
+  const sequenceName = 'test-plaintext-true'
+  const requestPath = '/post'
+  const requestBody = { text: 'hello plaintext' }
+  const expectedRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_post${NEW_EXTENSION}`)
+  const expectedPlainText = JSON.stringify({ message: 'mock post success', received_body: requestBody })
+
+  // Start proxy in record mode WITH plaintext option
+  t.context.proxy = await createProxy({
+    recordMode: true,
+    targetUrl: MOCK_TARGET_URL,
+    recordingsDir: TEST_RECORDINGS_DIR,
+    includePlainTextBody: true // <<< Enable the option
+  })
+
+  t.truthy(t.context.proxy, 'Proxy instance should be created')
+  t.context.proxy.setSequence(sequenceName)
+
+  // Make request
+  const proxyResponse = await axios.post(`${t.context.proxy.url}${requestPath}`, requestBody)
+  t.is(proxyResponse.status, 201)
+
+  // Wait for and validate recording
+  const fileExists = await waitForFile(expectedRecordingFile)
+  t.true(fileExists, 'Recording file should be created')
+
+  try {
+    const recordings = JSON.parse(await fs.readFile(expectedRecordingFile, 'utf8'))
+    t.is(recordings.length, 1, 'Should have one recording')
+    const recordedResponse = recordings[0].response
+
+    t.is(recordedResponse.status, 201)
+    // Verify plaintext field
+    t.true(recordedResponse.hasOwnProperty('bodyPlainText'), 'Response should have bodyPlainText field')
+    t.is(recordedResponse.bodyPlainText, expectedPlainText, 'bodyPlainText content should match expected decoded string')
+    // Verify chunks still exist
+    t.truthy(Array.isArray(recordedResponse.chunks), 'Response should still have chunks array')
+    t.is(recordedResponse.chunks.length, 1, 'Response should have one chunk for simple JSON')
+    t.is(Buffer.from(recordedResponse.chunks[0], 'base64').toString('utf8'), expectedPlainText, 'Decoded chunk should match plaintext')
+
+  } catch (e) {
+    t.fail(`Recording content validation failed: ${e.message}`)
+  }
+});
+
+test.serial('Record Mode: includePlainTextBody: false -> should NOT add bodyPlainText', async t => {
+  const sequenceName = 'test-plaintext-false'
+  const requestPath = '/get'
+  const expectedRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_get${NEW_EXTENSION}`)
+
+  // Start proxy in record mode WITHOUT plaintext option (default is false)
+  t.context.proxy = await createProxy({
+    recordMode: true,
+    targetUrl: MOCK_TARGET_URL,
+    recordingsDir: TEST_RECORDINGS_DIR
+    // includePlainTextBody is omitted (defaults to false)
+  })
+
+  t.truthy(t.context.proxy, 'Proxy instance should be created')
+  t.context.proxy.setSequence(sequenceName)
+
+  // Make request
+  const proxyResponse = await axios.get(`${t.context.proxy.url}${requestPath}`)
+  t.is(proxyResponse.status, 200)
+
+  // Wait for and validate recording
+  const fileExists = await waitForFile(expectedRecordingFile)
+  t.true(fileExists, 'Recording file should be created')
+
+  try {
+    const recordings = JSON.parse(await fs.readFile(expectedRecordingFile, 'utf8'))
+    t.is(recordings.length, 1, 'Should have one recording')
+    const recordedResponse = recordings[0].response
+
+    t.is(recordedResponse.status, 200)
+    // Verify plaintext field is ABSENT
+    t.false(recordedResponse.hasOwnProperty('bodyPlainText'), 'Response should NOT have bodyPlainText field')
+    // Verify chunks exist
+    t.truthy(Array.isArray(recordedResponse.chunks), 'Response should still have chunks array')
+    t.is(recordedResponse.chunks.length, 1, 'Response should have one chunk for simple JSON')
+
+  } catch (e) {
+    t.fail(`Recording content validation failed: ${e.message}`)
+  }
+}); 

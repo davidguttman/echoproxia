@@ -69,7 +69,8 @@ async function createProxy (options = {}) {
     targetUrl = 'http://localhost', // Need a default or make required
     recordingsDir = path.join(process.cwd(), '__recordings__'),
     defaultSequenceName = 'default-sequence',
-    redactHeaders: headersToRedactInput = ['authorization'] // Default redaction
+    redactHeaders: headersToRedactInput = ['authorization'], // Default redaction
+    includePlainTextBody = false // <<< Add new option with default
   } = options
 
   // --- State (scoped within createProxy) ---
@@ -80,6 +81,7 @@ async function createProxy (options = {}) {
   const replayCounters = {}
   const headersToRedact = headersToRedactInput.map(h => h.toLowerCase())
   let runningServer = null
+  const shouldIncludePlainText = includePlainTextBody // <<< Store the option value
   // --- End State ---
 
   // --- New State Variable ---
@@ -367,6 +369,23 @@ async function createProxy (options = {}) {
             const recordingFilename = sanitizeFilename(req.path);
             const recordingFilepath = path.join(currentRecordingsDir, currentSequenceName, recordingFilename);
 
+            // <<< START New Plaintext Logic >>>
+            let plainTextBody = null;
+            if (shouldIncludePlainText) {
+              try {
+                // Concatenate by decoding each base64 chunk first
+                const responseBuffer = Buffer.concat(recordedChunks.map(base64Chunk => Buffer.from(base64Chunk, 'base64')));
+                // Attempt basic UTF-8 decoding from the complete buffer.
+                // Note: This won't handle all encodings or binary data perfectly.
+                // More sophisticated decoding based on content-type could be added here.
+                plainTextBody = responseBuffer.toString('utf8');
+              } catch (decodeError) {
+                logWarn(`Could not decode response body to UTF-8 for ${recordingFilename}: ${decodeError.message}`);
+                plainTextBody = `[Echoproxia: Failed to decode body as UTF-8 - ${decodeError.message}]`;
+              }
+            }
+            // <<< END New Plaintext Logic >>>
+
             const recordedRequest = {
               method: req.method,
               path: req.path,
@@ -380,16 +399,16 @@ async function createProxy (options = {}) {
             const recordedResponse = {
               status: responseStatus,
               headers: headersForRecording,
-              body: null, // Remove old single body structure
-              chunks: recordedChunks // Store the array of base64 chunks
+              ...(plainTextBody !== null && { bodyPlainText: plainTextBody }),
+              chunks: recordedChunks
             };
 
-            logInfo(`Recording ${recordedChunks.length} chunks for ${req.path} to ${recordingFilename}`) // Log new filename
-            writeRecording(recordingFilepath, { request: recordedRequest, response: recordedResponse });
+            logInfo(`Recording ${recordedResponse.chunks.length} chunks for ${req.path} to ${recordingFilename} (PlainText: ${shouldIncludePlainText})`)
+            await writeRecording(recordingFilepath, { request: recordedRequest, response: recordedResponse });
 
             // Logging/Debug output (optional)
-            const logBody = completeBodyForLogging.toString('utf8').substring(0, 100) // Log first 100 chars
-            logInfo(`Finished proxying and recording for ${req.path}. Status: ${responseStatus}. Chunks: ${recordedChunks.length}. Start of body: ${logBody}...`)
+            // const logBody = plainTextBody !== null ? plainTextBody.substring(0, 100) : '(No plaintext body)'; // Use plaintext if available
+            // logInfo(`Finished proxying and recording for ${req.path}. Status: ${responseStatus}. Chunks: ${recordedResponse.chunks.length}. Start of body: ${logBody}...`)
           });
 
           proxyRes.on('error', (err) => {
