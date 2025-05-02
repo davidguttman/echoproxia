@@ -386,13 +386,29 @@ async function createProxy (options = {}) {
             }
             // <<< END New Plaintext Logic >>>
 
+            // <<< Decode Request Body Conditionally >>>
+            let requestBodyPlainText = null;
+            let originalRequestBody = req.body instanceof Buffer ? req.body.toString('base64') : (typeof req.body === 'string' ? req.body : null);
+            if (shouldIncludePlainText && originalRequestBody) {
+                try {
+                    const requestBuffer = req.body instanceof Buffer ? req.body : Buffer.from(originalRequestBody, 'utf8'); // Assume string is utf8 if not buffer
+                    requestBodyPlainText = requestBuffer.toString('utf8');
+                } catch (decodeError) {
+                    logWarn(`Could not decode request body to UTF-8 for ${recordingFilename}: ${decodeError.message}`);
+                    requestBodyPlainText = `[Echoproxia: Failed to decode request body as UTF-8 - ${decodeError.message}]`;
+                }
+            }
+            // <<< End Decode Request Body Conditionally >>>
+
             const recordedRequest = {
               method: req.method,
               path: req.path,
               originalUrl: req.originalUrl,
               headers: redactHeaders(req.headers, headersToRedact),
-              // Ensure request body is stored appropriately (assuming it wasn't streamed)
-              body: req.body instanceof Buffer ? req.body.toString('base64') : (typeof req.body === 'string' ? req.body : null)
+              // Original body (potentially base64)
+              body: originalRequestBody,
+              // Add plaintext request body conditionally
+              ...(requestBodyPlainText !== null && { bodyPlainText: requestBodyPlainText })
             };
 
             // New structure for recorded response, storing chunks

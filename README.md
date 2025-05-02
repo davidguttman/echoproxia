@@ -87,7 +87,7 @@ Creates and starts an Echoproxia instance, returning controls and details.
     *   `recordingsDir` `<String>` **Required.** The absolute path to the base directory where recording sequence subdirectories should be stored.
     *   `recordMode` `<Boolean>` **Required.** If `true`, operates in record mode. If `false`, operates in replay mode.
     *   `redactHeaders` `<Array<String>>` *Optional.* An array of lowercase header names whose values should be replaced with `[REDACTED]` in recordings. Defaults to `['authorization']`.
-    *   `includePlainTextBody` `<Boolean>` *Optional.* If `true`, attempts to decode the response body as UTF-8 and includes it as `bodyPlainText` in recordings. Defaults to `false`.
+    *   `includePlainTextBody` `<Boolean>` *Optional.* If `true`, attempts to decode **both the request and response bodies** as UTF-8 and includes them as `bodyPlainText` in recordings. Defaults to `false`.
 *   **Returns** `<Promise<Object>>` A Promise that resolves to an object with the following properties:
     *   `port` `<Number>`: The actual port the proxy server is listening on.
     *   `url` `<String>`: The base URL of the running proxy server (e.g., `http://localhost:<port>`).

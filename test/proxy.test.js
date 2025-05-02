@@ -617,6 +617,7 @@ test.serial('Record Mode: includePlainTextBody: true -> should add bodyPlainText
   const sequenceName = 'test-plaintext-true'
   const requestPath = '/post'
   const requestBody = { text: 'hello plaintext' }
+  const requestBodyString = JSON.stringify(requestBody)
   const expectedRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_post${NEW_EXTENSION}`)
   const expectedPlainText = JSON.stringify({ message: 'mock post success', received_body: requestBody })
 
@@ -642,10 +643,16 @@ test.serial('Record Mode: includePlainTextBody: true -> should add bodyPlainText
   try {
     const recordings = JSON.parse(await fs.readFile(expectedRecordingFile, 'utf8'))
     t.is(recordings.length, 1, 'Should have one recording')
+    const recordedRequest = recordings[0].request
     const recordedResponse = recordings[0].response
 
+    // Verify request plaintext field
+    t.true(recordedRequest.hasOwnProperty('bodyPlainText'), 'Request should have bodyPlainText field')
+    t.is(recordedRequest.bodyPlainText, requestBodyString, 'request.bodyPlainText content should match original request body')
+    t.truthy(recordedRequest.body, 'Original request.body should still exist')
+
     t.is(recordedResponse.status, 201)
-    // Verify plaintext field
+    // Verify response plaintext field
     t.true(recordedResponse.hasOwnProperty('bodyPlainText'), 'Response should have bodyPlainText field')
     t.is(recordedResponse.bodyPlainText, expectedPlainText, 'bodyPlainText content should match expected decoded string')
     // Verify chunks still exist
@@ -688,7 +695,9 @@ test.serial('Record Mode: includePlainTextBody: false -> should NOT add bodyPlai
     const recordedResponse = recordings[0].response
 
     t.is(recordedResponse.status, 200)
-    // Verify plaintext field is ABSENT
+    // Verify request plaintext field is ABSENT
+    t.false(recordings[0].request.hasOwnProperty('bodyPlainText'), 'Request should NOT have bodyPlainText field')
+    // Verify response plaintext field is ABSENT
     t.false(recordedResponse.hasOwnProperty('bodyPlainText'), 'Response should NOT have bodyPlainText field')
     // Verify chunks exist
     t.truthy(Array.isArray(recordedResponse.chunks), 'Response should still have chunks array')
