@@ -73,6 +73,7 @@ test('Test Scenario 2', async t => {
   // e.g., await fetch(`${t.context.proxy.url}/another/path`)
   t.pass()
 })
+```
 
 ## API
 
