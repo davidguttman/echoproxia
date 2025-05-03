@@ -52,13 +52,20 @@ test.before(async t => {
 
   return new Promise(resolve => {
     const mockApp = express()
-    mockApp.use(express.raw({ type: '*/*', limit: '10mb' }))
+    // Ensure body parsing middleware runs early
+    mockApp.use(express.json()); // For parsing JSON bodies
+    mockApp.use(express.text()); // For parsing text bodies if needed
+    mockApp.use(express.urlencoded({ extended: false })); // For form data
+    mockApp.use(express.raw({ type: '*/*', limit: '10mb' })) // Keep raw for proxy
+
     mockApp.use((req, res, next) => {
+      // Store potentially parsed body if available, otherwise raw buffer
+      const bodyToStore = req.body instanceof Buffer ? req.body : ( Object.keys(req.body || {}).length > 0 ? req.body : null );
       lastMockRequest = {
         method: req.method,
         path: req.originalUrl,
         headers: req.headers,
-        body: req.body
+        body: bodyToStore // Store parsed or raw body
       }
       next()
     })
@@ -66,15 +73,21 @@ test.before(async t => {
       res.status(200).json({ message: 'mock get success', query: req.query })
     })
     mockApp.post('/post', (req, res) => {
-      let bodyResponse
-      try {
-        bodyResponse = JSON.parse(req.body.toString('utf8'))
-      } catch (e) {
-        bodyResponse = req.body.toString('utf8')
-      }
-      res.status(201).json({ message: 'mock post success', received_body: bodyResponse })
+      res.status(201).json({ message: 'mock post success', received_body: req.body }) // Use parsed body
     })
+    
+    // >>> Add handlers for the plaintext test paths <<<
+    mockApp.get('/no-plaintext-get', (req, res) => {
+      res.status(200).json({ message: 'mock no-plaintext-get success' });
+    });
+    mockApp.post('/no-plaintext-post', (req, res) => {
+      res.status(201).json({ message: 'mock no-plaintext-post success', received_body: req.body });
+    });
+    // >>> End added handlers <<<
+    
+    // Catch-all for other paths
     mockApp.all('*', (req, res) => {
+      logWarn(`Mock server received unexpected request: ${req.method} ${req.originalUrl}`);
       res.status(404).send('Mock Not Found')
     })
 
@@ -370,14 +383,15 @@ test.serial('Replay Mode: Backwards Compatibility', async t => {
   const newFilePath = path.join(sequencePath, `${baseFilename}${NEW_EXTENSION}`)
   const oldFilePath = path.join(sequencePath, `${baseFilename}${OLD_EXTENSION}`)
 
-  // Helper to create a recording file
+  // Helper to create a recording file (Updated)
   const createRecording = async (filePath, responseData) => {
     const content = [{
-      request: { method: 'GET', path: requestPath, /* ... */ },
+      request: { method: 'GET', path: requestPath, headers:{}, body:null }, // Added missing headers/body
       response: {
         status: 200,
         headers: { 'content-type': 'application/json' },
-        chunks: [Buffer.from(JSON.stringify(responseData)).toString('base64')] // Simplified chunk
+        // Use 'body' instead of 'chunks'
+        body: Buffer.from(JSON.stringify(responseData)).toString('base64') 
       }
     }]
     await fs.mkdir(path.dirname(filePath), { recursive: true })
@@ -466,7 +480,14 @@ test.serial('Override: Global Record, Sequence Replay -> Should Replay', async t
   const sequenceName = 'override-global-record-seq-replay'
   const requestPath = '/get'
   const dummyRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_get${NEW_EXTENSION}`)
-  const dummyReplayData = [{ request: {}, response: { status: 299, headers: { 'x-replayed': 'true' }, chunks: [Buffer.from(JSON.stringify({ replay: 'override-works' })).toString('base64')] } }]
+  const dummyReplayData = [{
+    request: { method: 'GET', path: requestPath, headers:{}, body:null }, // Added request stub
+    response: {
+      status: 299,
+      headers: { 'x-replayed': 'true', 'content-type': 'application/json' }, // Added content-type
+      body: Buffer.from(JSON.stringify({ replay: 'override-works' })).toString('base64') 
+    }
+  }];
 
   // Prepare dummy recording
   await fs.mkdir(path.dirname(dummyRecordingFile), { recursive: true })
@@ -585,7 +606,14 @@ test.serial('Override: Global Replay, No Override -> Should Replay', async t => 
   const requestPath = '/post'
   const requestBody = { default: 'replay' }
   const dummyRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_post${NEW_EXTENSION}`)
-  const dummyReplayData = [{ request: {}, response: { status: 298, headers: { 'x-replayed-default': 'true' }, chunks: [Buffer.from(JSON.stringify({ replay: 'default-replay' })).toString('base64')] } }]
+  const dummyReplayData = [{
+    request: { method: 'POST', path: requestPath, headers:{}, body:null }, // Added request stub
+    response: {
+      status: 298,
+      headers: { 'x-replayed-default': 'true', 'content-type': 'application/json' }, // Added content-type
+      body: Buffer.from(JSON.stringify({ replay: 'default-replay' })).toString('base64') 
+    }
+  }];
 
   // Prepare dummy recording
   await fs.mkdir(path.dirname(dummyRecordingFile), { recursive: true })
@@ -728,4 +756,53 @@ test.serial('Record Mode: includePlainTextBody: false -> should NOT add bodyPlai
   t.is(typeof recordedResponse.body, 'string', 'POST Response body should still exist as a string');
   t.is(typeof recordedRequest.body, 'string', 'POST Request body should still exist as a string');
   t.falsy(recordedResponse.chunks, 'POST Response should NOT have chunks array anymore');
+});
+
+test.serial('Replay Mode: should NOT leak request to target on successful replay', async t => {
+  const sequenceName = 'test-replay-no-leak';
+  const requestPath = '/get';
+  const requestQuery = '?replay=success';
+  const recordingFilePath = path.join(TEST_RECORDINGS_DIR, sequenceName, sanitizeFilename(requestPath));
+
+  // Setup: Create a valid recording file for replay
+  const mockResponseData = { replayed: true };
+  const recordingContent = [{
+    request: { 
+      method: 'GET', 
+      path: requestPath, 
+      originalUrl: `${requestPath}${requestQuery}`, 
+      headers: {}, 
+      body: null 
+    },
+    response: {
+      status: 200,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'x-echoproxia-replayed': 'true' },
+      // Use 'body' field based on our previous refactor
+      body: Buffer.from(JSON.stringify(mockResponseData)).toString('base64') 
+    }
+  }];
+  await fs.mkdir(path.dirname(recordingFilePath), { recursive: true });
+  await fs.writeFile(recordingFilePath, JSON.stringify(recordingContent, null, 2));
+
+  // Start proxy in REPLAY mode
+  t.context.proxy = await createProxy({
+    recordMode: false,
+    targetUrl: MOCK_TARGET_URL, // Target URL is still needed, but shouldn't be hit
+    recordingsDir: TEST_RECORDINGS_DIR
+  });
+  t.truthy(t.context.proxy, 'Proxy instance should be created');
+  await t.context.proxy.setSequence(sequenceName);
+
+  lastMockRequest = null; // Reset mock state
+
+  // Make request - should be replayed
+  const response = await axios.get(`${t.context.proxy.url}${requestPath}${requestQuery}`);
+
+  // Assert response came from replay
+  t.is(response.status, 200);
+  t.deepEqual(response.data, mockResponseData);
+  t.is(response.headers['x-echoproxia-replayed'], 'true');
+
+  // >>> CRITICAL ASSERTION: Check that the mock target was NOT hit <<<
+  t.is(lastMockRequest, null, 'Mock target should NOT have been hit during replay'); 
 }); 

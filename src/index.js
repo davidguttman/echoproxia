@@ -250,13 +250,13 @@ async function createProxy (options = {}) {
     }
 
     const { response: recordedResponse } = sequenceRecordings[currentIndex];
-    // IMPORTANT: Update counter using usedFilepath
-    sequenceReplayState[usedFilepath] = currentIndex + 1;
+    sequenceReplayState[usedFilepath] = currentIndex + 1; // Update counter
 
-    // --- Streaming Replay Refactor --- (Keep existing streaming logic)
-    if (!recordedResponse.chunks || !Array.isArray(recordedResponse.chunks)) {
-      logError(`Replay Error: Recording at index ${currentIndex} for ${usedFilepath} is missing or has invalid 'chunks' format.`);
-      res.status(500).send(`Echoproxia Replay Error: Invalid recording format for path ${req.path} in sequence ${currentSequenceName}.`);
+    // --- Updated Replay Logic (using response.body) ---
+    // Check if the 'body' field exists and is a string (base64)
+    if (typeof recordedResponse.body !== 'string') {
+      logError(`Replay Error: Recording at index ${currentIndex} for ${usedFilepath} is missing or has invalid 'body' format (expected base64 string).`);
+      res.status(500).send(`Echoproxia Replay Error: Invalid recording format (missing body) for path ${req.path} in sequence ${currentSequenceName}.`);
       return false; // Indicate failure
     }
 
@@ -264,7 +264,8 @@ async function createProxy (options = {}) {
     res.status(recordedResponse.status);
     Object.entries(recordedResponse.headers).forEach(([key, value]) => {
       const lowerKey = key.toLowerCase();
-      if (lowerKey !== 'content-length' && lowerKey !== 'transfer-encoding') {
+      // Filter potentially problematic headers
+      if (lowerKey !== 'content-length' && lowerKey !== 'transfer-encoding') { 
           try {
               res.setHeader(key, value);
           } catch (headerErr) {
@@ -272,18 +273,21 @@ async function createProxy (options = {}) {
           }
       }
     });
+    // Don't manually set Content-Length, let Express handle it based on the buffer write.
     res.writeHead(recordedResponse.status);
 
-    // 2. Stream Chunks
-    for (const base64Chunk of recordedResponse.chunks) {
-      try {
-        const chunkBuffer = Buffer.from(base64Chunk, 'base64');
-        res.write(chunkBuffer);
-      } catch (decodeErr) {
-        logError(`Replay Error: Failed to decode base64 chunk at index ${currentIndex} for ${usedFilepath}: ${decodeErr.message}`);
-        res.end();
-        return false;
+    // 2. Decode and Send Body
+    try {
+      const responseBuffer = Buffer.from(recordedResponse.body, 'base64');
+      res.write(responseBuffer);
+    } catch (decodeErr) {
+      logError(`Replay Error: Failed to decode base64 body at index ${currentIndex} for ${usedFilepath}: ${decodeErr.message}`);
+      res.status(500).send(`Echoproxia Replay Error: Failed to decode recorded body for path ${req.path}.`);
+      // Ensure response ends even on error before returning
+      if (!res.writableEnded) {
+          res.end();
       }
+      return false;
     }
 
     // 3. End Stream
@@ -305,23 +309,23 @@ async function createProxy (options = {}) {
       return next()
     }
 
-    // Note: handleReplay now internally determines the correct file path (.echo.json or .json)
-    // We don't need to pass recordingFilepath directly anymore if handleReplay is self-contained
-    // const recordingFilename = sanitizeFilename(req.path);
-    // const recordingFilepath = path.join(currentRecordingsDir, currentSequenceName, recordingFilename);
-
     // Use the EFFECTIVE mode for the currently active sequence
     if (activeSequenceEffectiveMode === false) {
       // Replay Mode
-      // Pass necessary context, handleReplay finds the file
       const replayed = await handleReplay(req, res, { /* other context if needed */ })
+      
+      // handleReplay sends the response on success or failure.
+      // If it failed but somehow didn't send headers, log it, but we must stop here.
       if (!replayed && !res.headersSent) {
-        logError('Replay failed unexpectedly without sending response.')
-        res.status(500).send('Internal Echoproxia Replay Error.')
+        logError('handleReplay indicated failure but headers were not sent. Sending fallback 500.');
+        // Ensure a response is sent ONLY if handleReplay failed to do so.
+        res.status(500).send('Internal Echoproxia Replay Error: Failed to send replay response.');
       }
-      // Don't call next()
+      // >>> FIX RE-APPLIED (Final): Explicitly return to prevent falling through <<<
+      return; 
     } else {
       // Record Mode - Create and call the proxy middleware instance
+      logInfo(`Record mode active for ${req.path}, proxying to ${currentTargetUrl}`);
       const proxyMiddlewareInstance = createProxyMiddleware({
         target: currentTargetUrl, // Use the current URL directly
         changeOrigin: true,
@@ -453,7 +457,7 @@ async function createProxy (options = {}) {
           res.end('Proxy error: ' + err.message);
         }
       })
-      proxyMiddlewareInstance(req, res, next)
+      proxyMiddlewareInstance(req, res, next) // This line should only be reached in Record mode
     }
   })
 
