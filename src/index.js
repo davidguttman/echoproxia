@@ -345,54 +345,63 @@ async function createProxy (options = {}) {
           });
           res.writeHead(proxyRes.statusCode);
 
-          const recordedChunks = []; // Array to store chunks for recording
-          let completeBodyForLogging = Buffer.alloc(0) // Still buffer for potential non-stream logging/debugging if needed later
+          const responseBodyChunks = []; // Rename for clarity, store raw chunks
+          // let completeBodyForLogging = Buffer.alloc(0) // Removed, less useful now
 
           proxyRes.on('data', (chunk) => {
-            // 1. Send the chunk immediately to the client
-            res.write(chunk);
-            // 2. Capture the chunk for recording
-            recordedChunks.push(chunk.toString('base64')); // Store as base64
-            // 3. (Optional) Append to complete buffer if needed elsewhere
-            completeBodyForLogging = Buffer.concat([completeBodyForLogging, chunk])
+            res.write(chunk); // Stream to client
+            responseBodyChunks.push(chunk); // Store raw chunk for processing later
           });
 
           proxyRes.on('end', async () => {
-            // 1. Signal the end of the response stream to the client
-            res.end();
+            res.end(); // End client response
 
-            // 2. Now, process and save the recording with the captured chunks
             const responseStatus = proxyRes.statusCode;
-            // Clone original headers for recording, BEFORE potential manipulation
-            const headersForRecording = redactHeaders({ ...proxyRes.headers }, headersToRedact);
-
+            const responseHeaders = proxyRes.headers; // Keep original headers for checks
+            const headersForRecording = redactHeaders({ ...responseHeaders }, headersToRedact);
             const recordingFilename = sanitizeFilename(req.path);
             const recordingFilepath = path.join(currentRecordingsDir, currentSequenceName, recordingFilename);
 
-            // <<< START New Plaintext Logic >>>
-            let plainTextBody = null;
+            const responseBuffer = Buffer.concat(responseBodyChunks); // Complete raw response body
+
+            // <<< START Decompress and Decode Response Body Conditionally >>>
+            let responseBodyPlainText = null;
+            // Always store the original (potentially compressed) body as base64 for accurate replay
+            const responseBodyBase64 = responseBuffer.toString('base64'); 
+
             if (shouldIncludePlainText) {
-              try {
-                // Concatenate by decoding each base64 chunk first
-                const responseBuffer = Buffer.concat(recordedChunks.map(base64Chunk => Buffer.from(base64Chunk, 'base64')));
-                // Attempt basic UTF-8 decoding from the complete buffer.
-                // Note: This won't handle all encodings or binary data perfectly.
-                // More sophisticated decoding based on content-type could be added here.
-                plainTextBody = responseBuffer.toString('utf8');
-              } catch (decodeError) {
-                logWarn(`Could not decode response body to UTF-8 for ${recordingFilename}: ${decodeError.message}`);
-                plainTextBody = `[Echoproxia: Failed to decode body as UTF-8 - ${decodeError.message}]`;
-              }
+                let bufferToDecode = responseBuffer;
+                const contentEncoding = responseHeaders['content-encoding'];
+
+                try {
+                    // Decompress if necessary
+                    if (contentEncoding === 'gzip') {
+                        bufferToDecode = zlib.gunzipSync(responseBuffer);
+                        logInfo(`Decompressed GZIP response for ${recordingFilename}`);
+                    } else if (contentEncoding === 'deflate') {
+                        bufferToDecode = zlib.inflateSync(responseBuffer);
+                        logInfo(`Decompressed DEFLATE response for ${recordingFilename}`);
+                    } // Add other encodings like 'br' (brotli) if needed with require('iltorb') or similar
+
+                    // Now attempt UTF-8 decoding on the (potentially decompressed) buffer
+                    responseBodyPlainText = bufferToDecode.toString('utf8');
+                } catch (err) {
+                    // Log error with encoding info
+                    logWarn(`Could not decompress/decode response body for ${recordingFilename} (Encoding: ${contentEncoding || 'none'}): ${err.message}`);
+                    responseBodyPlainText = `[Echoproxia: Failed to decompress/decode response body as UTF-8 - ${err.message}]`;
+                }
             }
-            // <<< END New Plaintext Logic >>>
+            // <<< END Decompress and Decode Response Body Conditionally >>>
 
             // <<< Decode Request Body Conditionally >>>
             let requestBodyPlainText = null;
-            let originalRequestBody = req.body instanceof Buffer ? req.body.toString('base64') : (typeof req.body === 'string' ? req.body : null);
-            if (shouldIncludePlainText && originalRequestBody) {
+            // Prefer req.body directly if bodyParser middleware ran (like express.raw)
+            const originalRequestBodyBuffer = req.body instanceof Buffer ? req.body : null; 
+            const originalRequestBodyBase64 = originalRequestBodyBuffer ? originalRequestBodyBuffer.toString('base64') : null;
+
+            if (shouldIncludePlainText && originalRequestBodyBuffer) {
                 try {
-                    const requestBuffer = req.body instanceof Buffer ? req.body : Buffer.from(originalRequestBody, 'utf8'); // Assume string is utf8 if not buffer
-                    requestBodyPlainText = requestBuffer.toString('utf8');
+                    requestBodyPlainText = originalRequestBodyBuffer.toString('utf8');
                 } catch (decodeError) {
                     logWarn(`Could not decode request body to UTF-8 for ${recordingFilename}: ${decodeError.message}`);
                     requestBodyPlainText = `[Echoproxia: Failed to decode request body as UTF-8 - ${decodeError.message}]`;
@@ -405,26 +414,25 @@ async function createProxy (options = {}) {
               path: req.path,
               originalUrl: req.originalUrl,
               headers: redactHeaders(req.headers, headersToRedact),
-              // Original body (potentially base64)
-              body: originalRequestBody,
+              // Store original request body as base64
+              body: originalRequestBodyBase64, 
               // Add plaintext request body conditionally
               ...(requestBodyPlainText !== null && { bodyPlainText: requestBodyPlainText })
             };
 
-            // New structure for recorded response, storing chunks
+            // Store full original response body as base64, remove chunks
             const recordedResponse = {
               status: responseStatus,
               headers: headersForRecording,
-              ...(plainTextBody !== null && { bodyPlainText: plainTextBody }),
-              chunks: recordedChunks
+              ...(responseBodyPlainText !== null && { bodyPlainText: responseBodyPlainText }),
+              // Replace chunks with single base64 body for consistency and replay
+              body: responseBodyBase64 
+              // chunks: recordedChunks // DEPRECATED
             };
 
-            logInfo(`Recording ${recordedResponse.chunks.length} chunks for ${req.path} to ${recordingFilename} (PlainText: ${shouldIncludePlainText})`)
+            logInfo(`Recording interaction for ${req.path} to ${recordingFilename} (PlainText: ${shouldIncludePlainText})`);
             await writeRecording(recordingFilepath, { request: recordedRequest, response: recordedResponse });
 
-            // Logging/Debug output (optional)
-            // const logBody = plainTextBody !== null ? plainTextBody.substring(0, 100) : '(No plaintext body)'; // Use plaintext if available
-            // logInfo(`Finished proxying and recording for ${req.path}. Status: ${responseStatus}. Chunks: ${recordedResponse.chunks.length}. Start of body: ${logBody}...`)
           });
 
           proxyRes.on('error', (err) => {

@@ -8,6 +8,15 @@ const express = require('express')
 const getPort = require('get-port')
 const { createProxy } = require('../src/index') // Import the actual module interface
 
+// --- Helper: Define sanitizeFilename locally in the test file --- START
+function sanitizeFilename (filePath) {
+  // Replace slashes and invalid chars; ensure it starts with '_'
+  const baseName = `_${filePath.replace(/^\//, '').replace(/[^a-zA-Z0-9_.-]/g, '_')}`;
+  // Append the specific extension
+  return `${baseName}.echo.json`;
+}
+// --- Helper: Define sanitizeFilename locally in the test file --- END
+
 const TEST_RECORDINGS_DIR = path.join(__dirname, '__test_recordings__')
 // Define expected extensions
 const NEW_EXTENSION = '.echo.json'
@@ -156,10 +165,9 @@ test.serial('Record Mode: should proxy request and save recording', async t => {
     t.is(recorded.request.path, requestPath)
     t.is(recorded.response.status, 200)
     const expectedResponseJson = JSON.stringify({ message: 'mock get success', query: { query: '1', param: 'value' } })
-    const expectedChunk = Buffer.from(expectedResponseJson).toString('base64')
-    t.truthy(Array.isArray(recorded.response.chunks), 'Response should have chunks array')
-    t.is(recorded.response.chunks.length, 1, 'Response should have one chunk for simple JSON')
-    t.is(recorded.response.chunks[0], expectedChunk, 'Recorded chunk content should match expected')
+    const expectedBodyBase64 = Buffer.from(expectedResponseJson).toString('base64')
+    t.is(typeof recorded.response.body, 'string', 'Response body should be a string')
+    t.is(recorded.response.body, expectedBodyBase64, 'Response body should be the correct base64 content')
   } catch (e) {
     t.log('Failed to read/parse/validate recording', e)
     t.fail(`Recording content validation failed: ${e.message}`)
@@ -655,10 +663,8 @@ test.serial('Record Mode: includePlainTextBody: true -> should add bodyPlainText
     // Verify response plaintext field
     t.true(recordedResponse.hasOwnProperty('bodyPlainText'), 'Response should have bodyPlainText field')
     t.is(recordedResponse.bodyPlainText, expectedPlainText, 'bodyPlainText content should match expected decoded string')
-    // Verify chunks still exist
-    t.truthy(Array.isArray(recordedResponse.chunks), 'Response should still have chunks array')
-    t.is(recordedResponse.chunks.length, 1, 'Response should have one chunk for simple JSON')
-    t.is(Buffer.from(recordedResponse.chunks[0], 'base64').toString('utf8'), expectedPlainText, 'Decoded chunk should match plaintext')
+    // Verify chunks are GONE
+    t.falsy(recordedResponse.chunks, 'Response should NOT have chunks array anymore')
 
   } catch (e) {
     t.fail(`Recording content validation failed: ${e.message}`)
@@ -666,44 +672,60 @@ test.serial('Record Mode: includePlainTextBody: true -> should add bodyPlainText
 });
 
 test.serial('Record Mode: includePlainTextBody: false -> should NOT add bodyPlainText', async t => {
-  const sequenceName = 'test-plaintext-false'
-  const requestPath = '/get'
-  const expectedRecordingFile = path.join(TEST_RECORDINGS_DIR, sequenceName, `_get${NEW_EXTENSION}`)
+  const sequenceName = 'sequence-plaintext-false';
+  const recordingsDir = path.join(__dirname, '__test_recordings__'); // Assuming test recordings dir
 
-  // Start proxy in record mode WITHOUT plaintext option (default is false)
-  t.context.proxy = await createProxy({
-    recordMode: true,
-    targetUrl: MOCK_TARGET_URL,
-    recordingsDir: TEST_RECORDINGS_DIR
-    // includePlainTextBody is omitted (defaults to false)
-  })
+  // Inline Setup
+  const proxy = await createProxy({
+    recordMode: true, 
+    targetUrl: MOCK_TARGET_URL, // <<< Use the constant defined in test.before
+    recordingsDir: recordingsDir,
+    includePlainTextBody: false // Explicitly false
+  });
+  t.context.proxy = proxy; // Store on context for teardown hook
+  await proxy.setSequence(sequenceName);
 
-  t.truthy(t.context.proxy, 'Proxy instance should be created')
-  t.context.proxy.setSequence(sequenceName)
+  // Make a request WITHOUT a body first
+  const getPath = '/no-plaintext-get';
+  await fetch(`${proxy.url}${getPath}`);
 
-  // Make request
-  const proxyResponse = await axios.get(`${t.context.proxy.url}${requestPath}`)
-  t.is(proxyResponse.status, 200)
+  // Make a request WITH a body
+  const postPath = '/no-plaintext-post';
+  const requestPayload = { data: 'no plaintext payload' };
+  await fetch(`${proxy.url}${postPath}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestPayload)
+  });
 
-  // Wait for and validate recording
-  const fileExists = await waitForFile(expectedRecordingFile)
-  t.true(fileExists, 'Recording file should be created')
-
-  try {
-    const recordings = JSON.parse(await fs.readFile(expectedRecordingFile, 'utf8'))
-    t.is(recordings.length, 1, 'Should have one recording')
-    const recordedResponse = recordings[0].response
-
-    t.is(recordedResponse.status, 200)
-    // Verify request plaintext field is ABSENT
-    t.false(recordings[0].request.hasOwnProperty('bodyPlainText'), 'Request should NOT have bodyPlainText field')
-    // Verify response plaintext field is ABSENT
-    t.false(recordedResponse.hasOwnProperty('bodyPlainText'), 'Response should NOT have bodyPlainText field')
-    // Verify chunks exist
-    t.truthy(Array.isArray(recordedResponse.chunks), 'Response should still have chunks array')
-    t.is(recordedResponse.chunks.length, 1, 'Response should have one chunk for simple JSON')
-
-  } catch (e) {
-    t.fail(`Recording content validation failed: ${e.message}`)
+  // Inline Teardown
+  if (t.context.proxy && t.context.proxy.stop) {
+    await t.context.proxy.stop();
   }
+
+  // Check GET recording (no request body expected)
+  const recordingGetFilePath = path.join(recordingsDir, sequenceName, sanitizeFilename(getPath)); // Use sanitizeFilename helper
+  let data = await fs.readFile(recordingGetFilePath, 'utf-8');
+  let recordings = JSON.parse(data);
+  t.is(recordings.length, 1, 'Should have one GET recording');
+  let recordedResponse = recordings[0].response;
+  let recordedRequest = recordings[0].request;
+  t.falsy(recordedResponse.bodyPlainText, 'GET Response should NOT have bodyPlainText field');
+  t.falsy(recordedRequest.bodyPlainText, 'GET Request should NOT have bodyPlainText field');
+  t.is(typeof recordedResponse.body, 'string', 'GET Response body should still exist as a string');
+  t.is(recordedRequest.body, null, 'GET Request body should be null');
+  t.falsy(recordedResponse.chunks, 'GET Response should NOT have chunks array anymore');
+
+  // Check POST recording (request body expected)
+  const recordingPostFilePath = path.join(recordingsDir, sequenceName, sanitizeFilename(postPath)); // Use sanitizeFilename helper
+  data = await fs.readFile(recordingPostFilePath, 'utf-8');
+  recordings = JSON.parse(data);
+  t.is(recordings.length, 1, 'Should have one POST recording');
+  recordedResponse = recordings[0].response;
+  recordedRequest = recordings[0].request;
+  t.falsy(recordedResponse.bodyPlainText, 'POST Response should NOT have bodyPlainText field');
+  t.falsy(recordedRequest.bodyPlainText, 'POST Request should NOT have bodyPlainText field');
+  t.is(typeof recordedResponse.body, 'string', 'POST Response body should still exist as a string');
+  t.is(typeof recordedRequest.body, 'string', 'POST Request body should still exist as a string');
+  t.falsy(recordedResponse.chunks, 'POST Response should NOT have chunks array anymore');
 }); 

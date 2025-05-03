@@ -44,34 +44,65 @@ Introduce a new option `includePlainTextBody` to `createProxy`. When set to `tru
     // Find the 'else' block for Record Mode (activeSequenceEffectiveMode === true)
     // Inside createProxyMiddleware({ ... })
     onProxyRes: (proxyRes, req, res) => {
+      // --- Import zlib at the top of your src/index.js if not already there ---
+      // const zlib = require('zlib'); 
+      // ------------------------------------------------------------------------
+
       // ... (existing header forwarding, chunk collection setup) ...
-      const recordedChunks = [];
-      proxyRes.on('data', (chunk) => { /* ... collect base64 chunks ... */ });
+      const responseBodyChunks = []; // Renamed for clarity
+      proxyRes.on('data', (chunk) => {
+          responseBodyChunks.push(chunk); // Store raw chunks
+          // Note: We no longer store base64 chunks here directly if aiming for plaintext
+      });
 
       proxyRes.on('end', async () => {
-        res.end();
-        // ... (get status, headers, filename, filepath) ...
+        res.end(); // End the client response first
+        
+        const responseBuffer = Buffer.concat(responseBodyChunks);
+        const responseStatus = proxyRes.statusCode;
+        const responseHeaders = proxyRes.headers; // Keep original headers
+        const recordingFilename = generateFilename(req);
+        const sequenceDir = path.join(recordingsDir, activeSequenceName);
+        const recordingFilepath = path.join(sequenceDir, recordingFilename);
 
-        // <<< START Decode Response Body Conditionally >>>
+        await fs.ensureDir(sequenceDir); // Ensure directory exists
+
+        const headersForRecording = redactHeaders(responseHeaders, headersToRedact); // Redact original headers for recording
+
+        // <<< START Decompress and Decode Response Body Conditionally >>>
         let responseBodyPlainText = null;
-        if (shouldIncludePlainText) {
-          try {
-            const responseBuffer = Buffer.concat(recordedChunks.map(base64Chunk => Buffer.from(base64Chunk, 'base64')));
-            responseBodyPlainText = responseBuffer.toString('utf8');
-          } catch (decodeError) {
-            logWarn(`Could not decode response body to UTF-8 for ${recordingFilename}: ${decodeError.message}`);
-            responseBodyPlainText = `[Echoproxia: Failed to decode response body as UTF-8 - ${decodeError.message}]`;
-          }
-        }
-        // <<< END Decode Response Body Conditionally >>>
+        let responseBodyBase64 = responseBuffer.toString('base64'); // Keep base64 for chunks field always
 
-        // <<< START Decode Request Body Conditionally >>>
-        let requestBodyPlainText = null;
-        let originalRequestBody = req.body instanceof Buffer ? req.body.toString('base64') : (typeof req.body === 'string' ? req.body : null);
-        if (shouldIncludePlainText && originalRequestBody) {
+        if (shouldIncludePlainText) {
+            let bufferToDecode = responseBuffer;
+            const contentEncoding = responseHeaders['content-encoding'];
+
             try {
-                const requestBuffer = req.body instanceof Buffer ? req.body : Buffer.from(originalRequestBody, 'utf8');
-                requestBodyPlainText = requestBuffer.toString('utf8');
+                // Decompress if necessary
+                if (contentEncoding === 'gzip') {
+                    bufferToDecode = zlib.gunzipSync(responseBuffer);
+                } else if (contentEncoding === 'deflate') {
+                    bufferToDecode = zlib.inflateSync(responseBuffer);
+                } // Add other encodings like 'br' (brotli) if needed
+
+                // Now attempt UTF-8 decoding
+                responseBodyPlainText = bufferToDecode.toString('utf8');
+            } catch (err) {
+                logWarn(`Could not decompress/decode response body for ${recordingFilename} (Encoding: ${contentEncoding || 'none'}): ${err.message}`);
+                responseBodyPlainText = `[Echoproxia: Failed to decompress/decode response body as UTF-8 - ${err.message}]`;
+            }
+        }
+        // <<< END Decompress and Decode Response Body Conditionally >>>
+
+        // <<< START Decode Request Body Conditionally (No change needed here usually, request bodies typically aren't compressed in the same way) >>>
+        let requestBodyPlainText = null;
+        // Use req.originalBody which should be populated by a body parser middleware before proxying
+        const originalRequestBodyBuffer = req.originalBody instanceof Buffer ? req.originalBody : null;
+        const originalRequestBodyBase64 = originalRequestBodyBuffer ? originalRequestBodyBuffer.toString('base64') : null; 
+
+        if (shouldIncludePlainText && originalRequestBodyBuffer) {
+            try {
+                requestBodyPlainText = originalRequestBodyBuffer.toString('utf8');
             } catch (decodeError) {
                 logWarn(`Could not decode request body to UTF-8 for ${recordingFilename}: ${decodeError.message}`);
                 requestBodyPlainText = `[Echoproxia: Failed to decode request body as UTF-8 - ${decodeError.message}]`;
@@ -80,22 +111,36 @@ Introduce a new option `includePlainTextBody` to `createProxy`. When set to `tru
         // <<< END Decode Request Body Conditionally >>>
 
         const recordedRequest = {
-          method: req.method,
-          path: req.path,
-          originalUrl: req.originalUrl,
-          headers: redactHeaders(req.headers, headersToRedact),
-          body: originalRequestBody, // Original request body (string or base64)
-          ...(requestBodyPlainText !== null && { bodyPlainText: requestBodyPlainText }) // <<< Add conditional plaintext
+            method: req.method,
+            path: req.path, // Use req.path which is relative to the proxy mount point
+            originalUrl: req.originalUrl, // Keep originalUrl for potential full path context
+            headers: redactHeaders(req.headers, headersToRedact), // Redact incoming request headers
+            body: originalRequestBodyBase64, // Store original request body as base64 always
+            ...(requestBodyPlainText !== null && { bodyPlainText: requestBodyPlainText }) 
         };
 
         const recordedResponse = {
-          status: responseStatus,
-          headers: headersForRecording,
-          ...(responseBodyPlainText !== null && { bodyPlainText: responseBodyPlainText }), // <<< Add conditional plaintext
-          chunks: recordedChunks // Original base64 chunks
+            status: responseStatus,
+            headers: headersForRecording, // Use redacted headers here
+            ...(responseBodyPlainText !== null && { bodyPlainText: responseBodyPlainText }), 
+            // Keep the original (potentially compressed) body as base64 for accurate replay
+            body: responseBodyBase64 
+            // Deprecate 'chunks' if 'body' serves the full base64 content
+            // chunks: [responseBodyBase64] // Or just store the full base64 body once
         };
+        
+        const recordingData = { request: recordedRequest, response: recordedResponse };
 
-        // ... (write recording) ...
+        // ... (Write recording logic - needs adjustment if 'chunks' is removed/changed) ...
+        // Assuming write logic uses recordingData now
+         try {
+            // If file exists (record mode implies overwrite for simplicity in this tutorial stage)
+            // Note: Real implementation might append or use different logic based on 02-safer-recordings
+            await fs.writeFile(recordingFilepath, JSON.stringify(recordingData, null, 2)); // Write single interaction object
+            logInfo(`Recorded: ${recordingFilename} in ${activeSequenceName}`);
+         } catch (writeError) {
+            logError(`Failed to write recording ${recordingFilename}: ${writeError}`);
+         }
       });
 
       // ... (existing proxyRes.on('error')) ...
@@ -119,9 +164,7 @@ Introduce a new option `includePlainTextBody` to `createProxy`. When set to `tru
         "status": 200,
         "headers": { ... },
         "bodyPlainText": "{\"message\": \"Success!\"}", // <<< Optional field
-        "chunks": [
-          "eyJoZWxsbyI6ICJ3b3JsZCJ9"
-        ]
+        "body": "eyJtZXNzYWdlIjogIlN1Y2Nlc3MhIn0=" // <<< Optional field
       }
     }
     ```
@@ -145,7 +188,7 @@ Introduce a new option `includePlainTextBody` to `createProxy`. When set to `tru
     // Check Response
     t.truthy(recordedResponse.bodyPlainText, 'Expected response.bodyPlainText field to exist');
     t.is(recordedResponse.bodyPlainText, 'Expected decoded response content here');
-    t.truthy(Array.isArray(recordedResponse.chunks), 'Chunks should still exist');
+    t.truthy(Array.isArray(recordedResponse.body), 'Chunks should still exist');
     ```
 
 5.  **Update Documentation (`README.md`):**
