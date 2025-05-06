@@ -1,5 +1,6 @@
 # Project Status
 
+* FIX: Prevent potential hangs in consuming applications by ensuring the internal write queue processing loop (`processWriteQueue`) terminates when `proxy.stop()` is called. Introduced an `isStopping` flag to prevent `setImmediate` from rescheduling the loop after `stop` is initiated.
 * FIX: Resolved intermittent test failure (`Unexpected end of JSON input`) in `Record Mode: should append multiple requests...` test by ensuring the `proxy.stop()` method waits for both the write queue to be empty AND any active `fs.writeFile` operation to complete before closing the server. This prevents the test from reading the file before the final write is fully flushed.
 * REFACTOR: Implemented a sequential, asynchronous write queue using `setImmediate` for handling recordings in record mode to prevent potential file corruption from overlapping writes, replacing previous attempts involving delays or locks.
 * FEAT: Modified recording behavior in `src/index.js` (`writeRecording`) to append multiple interactions for the same path to the recording file array within a single sequence activation, instead of overwriting with only the latest interaction. File clearing still occurs on `setSequence` when in record mode.

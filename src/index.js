@@ -64,6 +64,10 @@ async function createProxy (options = {}) {
   const headersToRedact = headersToRedactInput.map(h => h.toLowerCase())
   let runningServer = null
   const shouldIncludePlainText = includePlainTextBody // <<< Store the option value
+  // <<< RE-ADD isWriting flag >>>
+  let isWriting = false;
+  // <<< ADD isStopping flag >>>
+  let isStopping = false;
   // --- End State ---
 
   // <<< NEW: In-memory store for recordings >>>
@@ -71,8 +75,6 @@ async function createProxy (options = {}) {
 
   // <<< NEW: Queue mechanism for file writes (INSIDE createProxy) >>>
   const writeQueue = []; // Array of { filePath: string, recordingsArray: any[] }
-  // <<< RE-ADD isWriting flag >>>
-  let isWriting = false;
 
   // <<< Queue processing function (INSIDE createProxy) >>>
   async function processWriteQueue () {
@@ -114,7 +116,12 @@ async function createProxy (options = {}) {
       // Unset isWriting flag
       isWriting = false;
       // ALWAYS Schedule the next iteration AFTER this one completes/errors
-      setImmediate(processWriteQueue);
+      // <<< Only schedule if not stopping >>>
+      if (!isStopping) {
+        setImmediate(processWriteQueue); 
+      } else {
+        logInfo('PROCESS_QUEUE: isStopping is true, loop terminates.');
+      }
     }
   }
 
@@ -558,7 +565,10 @@ async function createProxy (options = {}) {
           },
           // Add setMode, setTargetUrl etc. if needed for runtime changes
           stop: async () => {
-            // <<< Revert to minimal logs >>>
+            // <<< Set stopping flag >>>
+            logInfo('STOP: Setting isStopping flag.');
+            isStopping = true;
+
             logInfo(`Stop requested. Waiting for write queue and active write...`);
             while (writeQueue.length > 0 || isWriting) {
               await new Promise(resolve => setTimeout(resolve, 10)); // Keep the wait
