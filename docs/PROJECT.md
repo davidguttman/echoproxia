@@ -1,5 +1,9 @@
 # Project Status
 
+* FIX: Resolved intermittent test failure (`Unexpected end of JSON input`) in `Record Mode: should append multiple requests...` test by ensuring the `proxy.stop()` method waits for both the write queue to be empty AND any active `fs.writeFile` operation to complete before closing the server. This prevents the test from reading the file before the final write is fully flushed.
+* REFACTOR: Implemented a sequential, asynchronous write queue using `setImmediate` for handling recordings in record mode to prevent potential file corruption from overlapping writes, replacing previous attempts involving delays or locks.
+* FEAT: Modified recording behavior in `src/index.js` (`writeRecording`) to append multiple interactions for the same path to the recording file array within a single sequence activation, instead of overwriting with only the latest interaction. File clearing still occurs on `setSequence` when in record mode.
+* DOCS: Updated `README.md` to describe the new recording behavior (appending interactions).
 * Updated README.md to clarify the behavior of record mode when recordings already exist (interactions are appended).
 * ~~Updated `tutorials/04-plaintext-body.md` to correctly handle compressed (gzip/deflate) response bodies when generating `bodyPlainText`.~~ (Tutorial was already updated, the code was the issue).
 * Fixed bug in `src/index.js` where `includePlainTextBody` did not handle compressed (gzip/deflate) response bodies, causing compressed data to be saved as plaintext. The fix involves using `zlib` for decompression before UTF-8 decoding.

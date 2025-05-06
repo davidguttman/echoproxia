@@ -1,0 +1,54 @@
+[
+  {
+    "request": {
+      "method": "GET",
+      "path": "/get",
+      "originalUrl": "/get?append=first",
+      "headers": {
+        "accept": "application/json, text/plain, */*",
+        "user-agent": "axios/0.21.4",
+        "host": "localhost:5016",
+        "connection": "keep-alive"
+      },
+      "body": null
+    },
+    "response": {
+      "status": 200,
+      "headers": {
+        "x-powered-by": "Express",
+        "content-type": "application/json; charset=utf-8",
+        "content-length": "57",
+        "etag": "W/\"39-xWUlvpFCvdLk/a9EFyWbyiyFpkA\"",
+        "date": "Tue, 06 May 2025 01:57:39 GMT",
+        "connection": "close"
+      },
+      "body": "eyJtZXNzYWdlIjoibW9jayBnZXQgc3VjY2VzcyIsInF1ZXJ5Ijp7ImFwcGVuZCI6ImZpcnN0In19"
+    }
+  },
+  {
+    "request": {
+      "method": "GET",
+      "path": "/get",
+      "originalUrl": "/get?append=second",
+      "headers": {
+        "accept": "application/json, text/plain, */*",
+        "user-agent": "axios/0.21.4",
+        "host": "localhost:5016",
+        "connection": "keep-alive"
+      },
+      "body": null
+    },
+    "response": {
+      "status": 200,
+      "headers": {
+        "x-powered-by": "Express",
+        "content-type": "application/json; charset=utf-8",
+        "content-length": "58",
+        "etag": "W/\"3a-l632XkUv7Q6twy3W1BdPEtD4pxU\"",
+        "date": "Tue, 06 May 2025 01:57:39 GMT",
+        "connection": "close"
+      },
+      "body": "eyJtZXNzYWdlIjoibW9jayBnZXQgc3VjY2VzcyIsInF1ZXJ5Ijp7ImFwcGVuZCI6InNlY29uZCJ9fQ=="
+    }
+  }
+]

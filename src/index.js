@@ -45,24 +45,6 @@ async function readRecordings (filePath) {
   }
 }
 
-async function writeRecording (filePath, recording) {
-  const sequencePath = path.dirname(filePath); // e.g., __recordings__/my-test
-  try {
-    // Ensure the base directory for the sequence exists
-    await fs.mkdir(sequencePath, { recursive: true });
-
-    // Create a new array containing only the current recording
-    const recordings = [recording];
-    // filePath will now end in .echo.json due to sanitizeFilename change
-    await fs.writeFile(filePath, JSON.stringify(recordings, null, 2));
-    // Updated log message slightly
-    logInfo(`Recorded interaction to ${filePath} (new file)`);
-  } catch (error) {
-    logError(`Error writing recording to ${filePath}:`, error);
-  }
-}
-// --- End Helper Functions ---
-
 async function createProxy (options = {}) {
   const {
     recordMode = false,
@@ -83,6 +65,83 @@ async function createProxy (options = {}) {
   let runningServer = null
   const shouldIncludePlainText = includePlainTextBody // <<< Store the option value
   // --- End State ---
+
+  // <<< NEW: In-memory store for recordings >>>
+  const inMemoryRecordings = {}; // { sequenceName: { sanitizedFilePath: [interaction, ...] } }
+
+  // <<< NEW: Queue mechanism for file writes (INSIDE createProxy) >>>
+  const writeQueue = []; // Array of { filePath: string, recordingsArray: any[] }
+  // <<< RE-ADD isWriting flag >>>
+  let isWriting = false;
+
+  // <<< Queue processing function (INSIDE createProxy) >>>
+  async function processWriteQueue () {
+    // <<< Set isWriting flag >>>
+    if (isWriting) return; // Prevent concurrent processing loops
+
+    const job = writeQueue.shift(); // Get next task (if any)
+
+    if (!job) {
+      // No job, just schedule next check and exit this tick
+      setImmediate(processWriteQueue);
+      return;
+    }
+
+    // Found a job, mark as writing
+    isWriting = true; 
+
+    try {
+      // Only attempt write if a job exists (redundant check now, but safe)
+      if (job) { 
+        // <<< Revert to minimal log >>>
+        logInfo(`Processing write job for ${job.filePath} (${job.recordingsArray.length} items)`);
+        const sequencePath = path.dirname(job.filePath);
+        // Ensure the base directory for the sequence exists
+        await fs.mkdir(sequencePath, { recursive: true });
+        // Overwrite the file with the stringified full array
+        await fs.writeFile(job.filePath, JSON.stringify(job.recordingsArray, null, 2));
+        // <<< Revert to minimal log >>>
+        logInfo(`Wrote ${job.recordingsArray.length} interactions to ${job.filePath}`);
+      } // else { logInfo('Write queue empty, skipping write.'); } // Optional log
+    } catch (error) {
+      // Log error only if we were actually processing a job
+      if (job) { 
+        // <<< Revert to standard error log >>>
+        logError(`Error writing recordings to file ${job.filePath} from queue:`, error);
+      }
+      // Continue processing next item even if one fails?
+    } finally {
+      // Unset isWriting flag
+      isWriting = false;
+      // ALWAYS Schedule the next iteration AFTER this one completes/errors
+      setImmediate(processWriteQueue);
+    }
+  }
+
+  // <<< Function to add to queue (INSIDE createProxy) >>>
+  async function writeRecordingsToFile (filePath, recordingsArray) {
+    /*
+    // <<< REMOVE queue empty check >>>
+    const queueWasEmpty = writeQueue.length === 0;
+    */
+
+    // Add the task to the queue
+    writeQueue.push({ filePath, recordingsArray });
+    logInfo(`Queued write for ${filePath} (${recordingsArray.length} items, queue size: ${writeQueue.length})`); 
+    
+    // <<< REMOVE Conditional kickstart >>>
+    /*
+    // Kickstart the queue processor ONLY if it wasn't already running
+    if (queueWasEmpty) {
+      logInfo('Queue was empty, starting processor.');
+      processWriteQueue(); // Start the loop
+    }
+    */
+  }
+  // <<< END Queue functions >>>
+
+  // <<< START the perpetual queue processor >>>
+  processWriteQueue();
 
   // --- New State Variable ---
   let activeSequenceEffectiveMode = currentRecordMode // Initialize with global mode
@@ -151,29 +210,25 @@ async function createProxy (options = {}) {
     // --- Sequence Recording Cleanup Logic (Uses effectiveMode) ---
     if (effectiveMode === true) { // Only clear if effective mode is record
       const sequencePath = path.join(currentRecordingsDir, sequenceName)
-      logInfo(`Effective mode is 'record': Clearing *.echo.json files in: ${sequencePath}`)
+      logInfo(`Effective mode is \'record\': Clearing in-memory recordings and deleting directory for sequence: ${sequenceName}`);
+      // Clear memory for this sequence
+      inMemoryRecordings[sequenceName] = {};
+      // <<< ADD directory deletion >>>
       try {
-        const filenames = await fs.readdir(sequencePath)
-        for (const filename of filenames) {
-          if (filename.endsWith('.echo.json')) { // Target specific files
-            const filePath = path.join(sequencePath, filename)
-            try {
-              await fs.unlink(filePath)
-              logInfo(`Deleted recording file: ${filePath}`)
-            } catch (unlinkErr) {
-               logError(`Error deleting file ${filePath}:`, unlinkErr)
-            }
-          }
-        }
-      } catch (err) {
-        if (err.code === 'ENOENT') {
-          logInfo(`Sequence directory ${sequencePath} does not exist, nothing to clear.`)
+        // Delete the sequence directory recursively
+        await fs.rm(sequencePath, { recursive: true, force: true });
+        logInfo(`Deleted sequence directory: ${sequencePath}`);
+      } catch (rmErr) {
+        // Ignore ENOENT (dir doesn't exist), log others
+        if (rmErr.code !== 'ENOENT') {
+          logError(`Error deleting sequence directory ${sequencePath}:`, rmErr);
         } else {
-          logError(`Error reading sequence directory ${sequencePath} for cleanup:`, err)
+          logInfo(`Sequence directory ${sequencePath} did not exist, nothing to delete.`);
         }
       }
+      /* OLD file-by-file deletion logic commented out previously */
     } else {
-      logInfo(`Effective mode is 'replay': Skipping cleanup for ${sequenceName}`)
+      logInfo(`Effective mode is \'replay\': Skipping cleanup for ${sequenceName}`);
     }
     // --- End Cleanup Logic ---
 
@@ -434,8 +489,31 @@ async function createProxy (options = {}) {
               // chunks: recordedChunks // DEPRECATED
             };
 
-            logInfo(`Recording interaction for ${req.path} to ${recordingFilename} (PlainText: ${shouldIncludePlainText})`);
-            await writeRecording(recordingFilepath, { request: recordedRequest, response: recordedResponse });
+            // <<< MODIFY: Store in memory AND trigger immediate write >>>
+            const interaction = { request: recordedRequest, response: recordedResponse };
+
+            // Ensure sequence entry exists in memory
+            if (!inMemoryRecordings[currentSequenceName]) {
+              inMemoryRecordings[currentSequenceName] = {};
+            }
+            // Ensure path entry array exists in memory
+            if (!inMemoryRecordings[currentSequenceName][recordingFilename]) {
+              inMemoryRecordings[currentSequenceName][recordingFilename] = [];
+            }
+            // Append interaction to memory
+            inMemoryRecordings[currentSequenceName][recordingFilename].push(interaction);
+
+            // Get the full updated array from memory
+            const updatedRecordingsForPath = inMemoryRecordings[currentSequenceName][recordingFilename];
+
+            logInfo(`Recording interaction ${updatedRecordingsForPath.length} for ${req.path} to ${recordingFilename} (Queuing write)`);
+            // Trigger write queue processing (no await)
+            writeRecordingsToFile(recordingFilepath, updatedRecordingsForPath);
+            /* 
+            // OLD direct write call:
+            // logInfo(`Recording interaction for ${req.path} to ${recordingFilename} (PlainText: ${shouldIncludePlainText})`);
+            // await writeRecording(recordingFilepath, { request: recordedRequest, response: recordedResponse });
+            */
 
           });
 
@@ -480,11 +558,20 @@ async function createProxy (options = {}) {
           },
           // Add setMode, setTargetUrl etc. if needed for runtime changes
           stop: async () => {
+            // <<< Revert to minimal logs >>>
+            logInfo(`Stop requested. Waiting for write queue and active write...`);
+            while (writeQueue.length > 0 || isWriting) {
+              await new Promise(resolve => setTimeout(resolve, 10)); // Keep the wait
+            }
+            logInfo(`STOP: Write queue drained and no active write.`);
+
             return new Promise((resolveStop, rejectStop) => {
               if (runningServer) {
                 runningServer.close((err) => {
-                  if (err) return rejectStop(err)
-                  logInfo('Server stopped')
+                  if (err) {
+                    return rejectStop(err)
+                  }
+                  logInfo('Server stopped'); // Keep standard stop log
                   runningServer = null
                   resolveStop()
                 })

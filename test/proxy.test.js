@@ -335,8 +335,8 @@ test.serial('Record Mode: setSequence should clear only .echo.json files', async
 
   // Assert state after setSequence
   await t.throwsAsync(fs.access(fileToClear), { code: 'ENOENT' }, 'Expected .echo.json to be deleted')
-  await t.notThrowsAsync(fs.access(fileToKeepJson), 'Expected .json to be kept')
-  await t.notThrowsAsync(fs.access(fileToKeepOther), 'Expected .other.txt to be kept')
+  await t.throwsAsync(fs.access(fileToKeepJson), { code: 'ENOENT' }, 'Expected .json to be deleted by directory removal')
+  await t.throwsAsync(fs.access(fileToKeepOther), { code: 'ENOENT' }, 'Expected .other.txt to be deleted by directory removal')
 });
 
 test.serial('Record Mode: Initial startup should clear only .echo.json from default sequence', async t => {
@@ -805,4 +805,71 @@ test.serial('Replay Mode: should NOT leak request to target on successful replay
 
   // >>> CRITICAL ASSERTION: Check that the mock target was NOT hit <<<
   t.is(lastMockRequest, null, 'Mock target should NOT have been hit during replay'); 
+});
+
+test.serial('Record Mode: should append multiple requests to the same path', async t => {
+  const sequenceName = 'test-append-sequence';
+  const requestPath = '/get';
+  const query1 = '?append=first';
+  const query2 = '?append=second';
+  const recordingFilename = sanitizeFilename(requestPath); // Use the helper
+  const recordingFilePath = path.join(TEST_RECORDINGS_DIR, sequenceName, recordingFilename);
+
+  // Start proxy in record mode
+  t.context.proxy = await createProxy({
+    recordMode: true,
+    targetUrl: MOCK_TARGET_URL,
+    recordingsDir: TEST_RECORDINGS_DIR
+  });
+  t.truthy(t.context.proxy, 'Proxy instance should be created');
+
+  // Set sequence
+  await t.context.proxy.setSequence(sequenceName);
+
+  // Make first request
+  const proxyResponse1 = await axios.get(`${t.context.proxy.url}${requestPath}${query1}`);
+  t.is(proxyResponse1.status, 200, 'First request should succeed');
+  t.deepEqual(proxyResponse1.data.query, { append: 'first' });
+
+  // Make second request to the same path
+  const proxyResponse2 = await axios.get(`${t.context.proxy.url}${requestPath}${query2}`);
+  t.is(proxyResponse2.status, 200, 'Second request should succeed');
+  t.deepEqual(proxyResponse2.data.query, { append: 'second' });
+
+  // Stop the proxy to ensure files are flushed (though not strictly needed with current fs ops)
+  await t.context.proxy.stop();
+  t.context.proxy = null; // Prevent afterEach from trying to stop again
+
+  // Wait for the recording file to appear
+  const fileExists = await waitForFile(recordingFilePath);
+  t.true(fileExists, `Recording file ${recordingFilename} should be created`);
+
+  // Assert recording content
+  try {
+    const rawContent = await fs.readFile(recordingFilePath, 'utf8');
+    const recordings = JSON.parse(rawContent);
+    t.is(recordings.length, 2, 'Should have two recordings in the array');
+
+    // Check first recording
+    t.is(recordings[0].request.method, 'GET');
+    t.is(recordings[0].request.path, requestPath);
+    t.is(recordings[0].request.originalUrl, `${requestPath}${query1}`);
+    t.is(recordings[0].response.status, 200);
+    let expectedResponseJson1 = JSON.stringify({ message: 'mock get success', query: { append: 'first' } });
+    let expectedBodyBase641 = Buffer.from(expectedResponseJson1).toString('base64');
+    t.is(recordings[0].response.body, expectedBodyBase641, 'First response body mismatch');
+
+    // Check second recording
+    t.is(recordings[1].request.method, 'GET');
+    t.is(recordings[1].request.path, requestPath);
+    t.is(recordings[1].request.originalUrl, `${requestPath}${query2}`);
+    t.is(recordings[1].response.status, 200);
+    let expectedResponseJson2 = JSON.stringify({ message: 'mock get success', query: { append: 'second' } });
+    let expectedBodyBase642 = Buffer.from(expectedResponseJson2).toString('base64');
+    t.is(recordings[1].response.body, expectedBodyBase642, 'Second response body mismatch');
+
+  } catch (e) {
+    t.log('Failed to read/parse/validate appended recording', e);
+    t.fail(`Appended recording content validation failed: ${e.message}`);
+  }
 }); 
