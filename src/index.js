@@ -85,7 +85,7 @@ async function createProxy (options = {}) {
 
     if (!job) {
       // No job, just schedule next check and exit this tick
-      setImmediate(processWriteQueue);
+      if (!isStopping) setImmediate(processWriteQueue);
       return;
     }
 
